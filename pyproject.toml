@@ -1,6 +1,6 @@
 [project]
 name = "marrow"
-version = "0.1.3"
+version = "0.1.4"
 description = "Frida-equivalent dynamic instrumentation for HotSpot JVMs (Python out-of-process layer + C++ agent)."
 readme = "README.md"
 license = { text = "Apache-2.0" }

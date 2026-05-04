@@ -6,6 +6,40 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-05-04
+
+End-to-end verification round against every Frida idiom from the
+canonical Android SSL-repinning script surfaced two real bugs in v0.1.3:
+
+### Fixed
+
+- `Java.use("dotted.name").$name` now returns the canonical slashed
+  form (`"java/lang/String"`), matching what `Marrow.findClass`
+  internally normalises to. Previously the `$name` echoed whatever the
+  user passed, so identity checks like `cls.$name === "java/lang/X"`
+  would unpredictably fail depending on whether the script used dotted
+  or slashed input.
+- Cast'd-proxy method calls now preserve `.overload(sig)`. v0.1.3
+  let you call `s.getBytes()` directly thanks to multi-overload
+  dispatch, but `s.getBytes.overload("()[B")` (Frida-style explicit
+  overload pick on an instance method) failed with
+  "undefined not callable (property 'overload')" because
+  `_bindMethodOnThis` wasn't carrying `handle.overload` onto the
+  bound function. Now bound methods expose `.overload(...)` that
+  re-binds the picked single via `_bindMethodOnThis`, keeping the
+  receiver-from-`this` semantics.
+
+### Verified
+
+- `tests/verify_ssl_pinning_idioms.py` — 9/9 PASS, covering every
+  Frida pattern from the SSL-repinning script (Java.use dotted, static
+  L-return chained into instance call, multi-overload static dispatch,
+  array auto-proxy, JS-string arg auto-alloc, null arg pass-through,
+  Java.cast with use'd handle, bound `.overload` chain).
+- All previous smoke / verify suites still PASS (`agent_smoke 24/24` on
+  JDK 8/11/17/21/25, `smoke_extended 22/22`, `verify_frida_parity 3/3`,
+  `verify_array_and_strarg 3/3`, `verify_autocast`).
+
 ## [0.1.3] — 2026-05-04
 
 Drops the last two known Frida-parity holes from the v0.1.1 release notes:

@@ -258,10 +258,16 @@ R"JS(
     // (java/lang/String has ~140) and the proxy is immutable.
     _useCache: {},
     use: function(name) {
-        var cached = Java._useCache[name];
+        // Normalise dotted -> slashed form once, so cls.$name is the
+        // canonical JVM-internal representation regardless of how the
+        // user wrote it. Frida-style scripts mix both freely.
+        var canonical = name.indexOf('.') >= 0 ? name.replace(/\./g, '/') : name;
+        var cached = Java._useCache[canonical];
         if (cached) return cached;
-        var k = Marrow.findClass(name);
+        var k = Marrow.findClass(canonical);
         if (!k) throw new Error("class not found: " + name);
+        // From here on use the canonical name everywhere downstream.
+        name = canonical;
         var methods = Marrow.listMethods(k);
         // Use a name->arr map without prototype pollution; Object's
         // Object.prototype methods (toString, hashCode, valueOf, …)
@@ -1198,6 +1204,15 @@ R"JS(
         bound.$returnClass  = handle.$returnClass;
         bound.argumentTypes = handle.argumentTypes;
         bound.returnType    = handle.returnType;
+        // Preserve .overload so cast'd-proxy.method.overload(sig) works
+        // -- common Frida idiom for picking a specific signature when
+        // the same name has both a no-arg form and parameterised forms.
+        if (handle.overload) {
+            bound.overload = function() {
+                var picked = handle.overload.apply(handle, arguments);
+                return Java._bindMethodOnThis(picked);
+            };
+        }
         return bound;
     },
 
@@ -1211,6 +1226,9 @@ R"JS(
     // racing against the scan may be missed (caller can re-run). Pass
     // `safe: true` to opt into the legacy SuspendAll behaviour for cases
     // where strict consistency is required.
+)JS"
+// MSVC ~16K split point.
+R"JS(
     choose: function(name, callbacks) {
         var cls   = Java.use(name);
         var limit = callbacks.limit || 0;
