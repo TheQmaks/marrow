@@ -6,6 +6,50 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-05-05
+
+Self-driven fourth stress round (`tests/verify_stress4.py`) covering
+concurrency between JVM threads and the agent thread, install/uninstall
+leak loops, hot-call interleaving, and `Java.reload()` cycles. **First
+round that found no new bugs** — these axes are stable.
+
+### Added — regression guards
+
+- `tests/verify_stress4.py` — 5-check matrix:
+  - Cross-thread observer: `T.tick.attach(fn)` while Target's main
+    thread fires tick every 500ms; agent counts fires after 2.5s sleep.
+  - Install/uninstall hook 50× — verify no resource leak / state corruption.
+  - Interleaved hot calls: 500-iteration loop on hooked `addInts` while
+    Target's main thread is firing tick.
+  - 10-cycle `Java.reload()` loop — install hook, reload, install again.
+  - Final verification: addInts works after the reload chain.
+
+### Verified
+
+```
+verify_stress4 5/5 PASS on all 5 JDKs (25/25)
+verify_stress3 11/11 PASS on all 5 JDKs (regression)
+verify_stress2 13/13 PASS on all 5 JDKs (regression)
+verify_stress  34/34 PASS on all 5 JDKs (regression)
+agent_smoke    24/24 PASS on all 5 JDKs (regression)
+```
+
+Total ~435 cross-JDK checks across 4 stress matrices + smoke.
+
+### Honest takeaway
+
+Stress rounds 1–3 each found 1–5 latent bugs. Round 4 found none —
+the concurrency / install-loop / reload axes are clean. That's a
+useful signal: the type-axis bug-finding rate is decreasing as
+coverage broadens. Pattern still holds though: each new axis added
+to the matrix is a regression guard against future changes breaking
+that axis silently.
+
+Axes still untouched (research-grade, deferred):
+- High-throughput hook firing (>10kHz) over minutes — needs custom Java target generating that rate.
+- Multi-dim arrays from Java code (`String[][]`) — needs custom Java method, stdlib doesn't naturally produce.
+- Memory pressure under sustained allocation churn — needs minutes of run time.
+
 ## [0.1.7] — 2026-05-05
 
 Self-driven third stress round (`tests/verify_stress3.py`) covering
