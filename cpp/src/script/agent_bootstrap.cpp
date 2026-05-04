@@ -597,17 +597,32 @@ R"JS(
         if (bytes.length > 0) {
             Marrow._writeMem("0x" + base.toString(16), bytes);
         }
-        // Call String.valueOf(char[]) — picks the [C overload explicitly.
-        var STR = Java.use("java/lang/String");
-        var voHandle = STR.valueOf;
-        if (voHandle && typeof voHandle.overload === "function") {
-            voHandle = voHandle.overload("([C)Ljava/lang/String;");
+        // Cache String.valueOf([C) handle once per process — avoids
+        // re-resolving the overload list on every alloc and (more
+        // importantly) avoids re-running Java.use's full method
+        // enumeration which itself triggers many Marrow.* calls. _jstring
+        // is on the hot path of arg coercion, so this matters.
+        if (!Java._jstring_voHandle) {
+            var STR = Java.use("java/lang/String");
+            var vo = STR.valueOf;
+            if (vo && typeof vo.overload === "function") {
+                vo = vo.overload("([C)Ljava/lang/String;");
+            }
+            Java._jstring_voHandle = vo;
         }
-        // voHandle is now a callable single handle. It returns the unwrapped
-        // String oop because retType is L; _unwrap converts T_OBJECT to a hex
-        // string (or null).
-        var resultOop = voHandle(arrOop);
-        return resultOop;
+        var voHandle = Java._jstring_voHandle;
+        if (!voHandle || !voHandle.$method) return null;
+        // Direct _invokeJC (bypassing the single's `function() { ... }`
+        // body which would re-enter Java.invokeStatic). When _jstring
+        // is called from inside _coerceArg (auto-alloc for user JS
+        // strings), recursing back into Java.invokeStatic corrupts
+        // shared invocation state and the outer call returns
+        // java_exception. Going directly to _invokeJC keeps _jstring
+        // a pure primitive that doesn't re-enter the high-level dispatch.
+        var addr = Java._parseHex(voHandle.$method.addr);
+        var raw  = Marrow._invokeJC(addr.lo, addr.hi, "L", "L", [arrOop]);
+        var m = String(raw).match(/value:0x([0-9a-f]+)/);
+        return m ? "0x" + m[1] : null;
     },
 
 )JS"
@@ -836,12 +851,43 @@ R"JS(
         //   "[Ljava/lang/X;"  → array sig fragment; for T_ARRAY, _castArray applies
         //   "[I", "[B", ...   → primitive-element array sig fragments
         //
-        // Backward compat: callers that still pass a bare class name for
-        // T_OBJECT keep working. Array auto-cast only fires when the caller
-        // passes the full "[..." fragment.
+        // Two C++ return-string formats handled:
+        //   "{type:N, value:0xX}" — typed (from _invokeJC)
+        //   "value:0xX"           — bare value (from _invokeJNI primitive path)
+        // The bare form lacks the type tag; in that case we lean on the
+        // caller's returnTypeSig (the method signature's return type) to
+        // decide how to decode. Callers that pass returnTypeSig get correct
+        // primitives for the JNI-surface fast path.
         if (typeof r !== "string") return r;
+        // The C++ JNI surface returns the literal "ok" for void-returning
+        // methods (success status, no value to wrap). Map to JS undefined
+        // so user code matches Frida semantics: void method → undefined.
+        if (r === "ok") return undefined;
         var m = r.match(/^\{type:(\d+),\s*value:0x([0-9a-f]+)\}$/);
-        if (!m) return r;
+        if (!m) {
+            // Bare "value:0xX" form. Decode by sig.
+            var b = r.match(/^value:0x([0-9a-f]+)$/);
+            if (b && returnTypeSig) {
+                var hex = b[1];
+                // returnTypeSig is bare class for L or sig fragment for [.
+                // For primitives the caller may have passed the JVM letter
+                // (rare) or null. Here we infer from sig presence: if it
+                // starts with [ → array, else if non-null and not "V" → L.
+                // For the JNI surface, primitives don't pass returnTypeSig,
+                // so we fall through to numeric decode below.
+            }
+            // Treat as primitive integer when no type info available.
+            if (b) {
+                var hh = b[1];
+                if (hh.length <= 8) {
+                    var n = parseInt(hh, 16);
+                    if (n >= 0x80000000) n -= 0x100000000;
+                    return n;
+                }
+                return "0x" + hh;  // long-shaped — preserve precision
+            }
+            return r;
+        }
         var type = parseInt(m[1], 10);
         var hex  = m[2];
         switch (type) {
@@ -887,6 +933,9 @@ R"JS(
     // duktape memory on huge byte[] payloads. For larger arrays we keep
     // $oop and $length set but $truncated=true; caller can chunk via
     // Marrow._readArray(oop, kind, n) directly.
+)JS"
+// MSVC ~16K split.
+R"JS(
     _castArray: function(oopHex, sigFragment) {
         // sigFragment like "[Ljava/lang/String;" or "[B" or "[[I".
         // Skip leading '['s to find the element kind.
@@ -1704,11 +1753,26 @@ R"JS(
     _coerceArg: function(v) {
         if (v && typeof v === 'object' && typeof v.$oop === 'string')
             return v.$oop;
-        if (typeof v === 'string' && v.indexOf('0x') !== 0) {
-            try {
-                var oop = Java._jstring(v);
-                if (oop) return oop;
-            } catch (e) { /* fall through with original string */ }
+        if (typeof v === 'string') {
+            // Heuristic: treat as raw oop hex only if it LOOKS like a real
+            // oop — "0x" prefix, all hex digits, AND >= 10 chars total
+            // (= 32-bit narrow oop minimum). Anything shorter ("0xCAFE",
+            // "0x1") is almost certainly user-typed text intended as a
+            // String content. Without this guard "0xCAFE" got passed as
+            // an actual pointer to address 0xCAFE — invalid memory deref
+            // crashes the JVM. Frida-style scripts pass JS strings freely
+            // and never expect "0x..." literals to be raw pointers.
+            var looksLikeOop = (
+                v.length >= 10 &&
+                v.indexOf('0x') === 0 &&
+                /^0x[0-9a-fA-F]+$/.test(v)
+            );
+            if (!looksLikeOop) {
+                try {
+                    var oop = Java._jstring(v);
+                    if (oop) return oop;
+                } catch (e) { /* fall through with original string */ }
+            }
         }
         return v;
     },
@@ -1782,8 +1846,17 @@ R"JS(
         if (method && method.$class && method.$method) {
             var sig = method.$method.sig;
             var p   = Java.parseSig(sig);
-            var hasObj = p.args.indexOf('L') >= 0 || p.args.indexOf('[') >= 0
-                          || p.ret === 'L' || p.ret === '[';
+            // p.args is an array of {type, className?} objects; iterate
+            // properly. (Prior version used p.args.indexOf('L') which
+            // never matched and silently routed L-arg statics through
+            // the JNI surface path with un-coerced args, producing
+            // java_exception when a JS string literal hit the C++ side
+            // as a raw pointer.)
+            var hasObj = (p.ret === 'L' || p.ret === '[');
+            for (var ai = 0; !hasObj && ai < p.args.length; ++ai) {
+                var t = p.args[ai].type;
+                if (t === 'L' || t === '[') hasObj = true;
+            }
             if (!hasObj) {
                 return Java._unwrap(Marrow._invokeJNI(
                     method.$class, method.$method.name, sig, p.ret, args || []),

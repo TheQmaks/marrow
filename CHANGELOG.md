@@ -6,6 +6,76 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-05-05
+
+Comprehensive stress test (`tests/verify_stress.py`) covering every primitive
+type, object type, array type, hook lifecycle, multi-overload dispatch, and
+edge case surfaced **five real bugs** that earlier focused tests missed.
+Most user-visible: static methods with object args silently broke when the
+user passed JS string literals.
+
+### Fixed
+
+- **`Java.invokeStatic` static-method-with-object-args was structurally
+  broken.** The `hasObj = p.args.indexOf('L') >= 0` check operated on an
+  array of `{type, className}` objects, not an array of letters, so
+  `indexOf('L')` always returned -1. Effect: static methods with L-typed
+  args silently routed through the JNI-surface fast path (which expects
+  primitives) with **un-coerced JS string literals** as args. The C++
+  side dereferenced them as raw oop pointers and the call failed with
+  `java_exception` (best case) or crashed the JVM (worst case). Now
+  iterates `p.args` properly.
+- **JS-string-as-raw-oop ambiguity.** Plain JS strings starting with
+  `"0x"` (e.g. `"0xCAFE"` as user content) were misinterpreted as raw
+  oop pointers and dereferenced. New `_coerceArg` heuristic: only treat
+  as oop if length ≥ 10 AND matches `/^0x[0-9a-fA-F]+$/`. Anything
+  shorter is plain JS string content → `_jstring` allocation.
+- **`_jstring` recursion via `Java.invokeStatic`.** v0.1.1+'s
+  L-return auto-cast made `_jstring`'s internal `voHandle(arrOop)` call
+  re-enter `Java.invokeStatic`. When `_jstring` was invoked from inside
+  `_coerceArg` (auto-allocating user JS strings for an outer Java call),
+  the nested re-entry corrupted shared invocation state. `_jstring`
+  now goes directly to `_invokeJC`, bypassing the high-level dispatch.
+  Also caches the resolved `String.valueOf([C)String` handle once per
+  process.
+- **`_unwrap` couldn't decode JNI-surface bare returns.** The C++ side
+  emits `"value:0xN"` (no `{type:N, ...}` wrapper) for the JNI-surface
+  primitive path, but `_unwrap`'s regex required the wrapped form. JS
+  callers got a literal `"value:0x2a"` string back from `addInts(40, 2)`
+  instead of `42`. Now parses both formats; bare form decodes by sig.
+- **`_unwrap` didn't map `"ok"` to `undefined` for void returns.**
+  Void-returning Java methods came back as the literal status string
+  `"ok"`. Now mapped to JS `undefined`.
+
+### Added
+
+- `tests/verify_stress.py` — 34-check stress matrix exercising every
+  primitive type (I/J/V/no-args/4-args), every string edge case (empty,
+  unicode-via-`\u`, hex-looking-literal, null, self), every primitive
+  array type via stdlib (byte[]/char[]/String[]), boxed types
+  (Integer/Long), full hook lifecycle (install → callOriginal → unhook →
+  rehook), cast invariants (proto sharing, dotted/slashed normalisation),
+  multi-overload dispatch (1-arg vs 2-arg `Integer.toString`), and error
+  paths. Batched into 4 evals to stay under the marrow.exe argv budget.
+
+### Verified — comprehensive
+
+- `tests/verify_stress.py` 34/34 PASS on JDK 8, 11, 17, 21, 25 (170/170).
+- `agent_smoke 24/24 PASS` on JDK 8, 11, 17, 21, 25 (120/120).
+- `smoke_extended 22/22 PASS` on JDK 17.
+- `verify_frida_parity 3/3`, `verify_array_and_strarg 3/3`,
+  `verify_ssl_pinning_idioms 9/9`, `verify_autocast PASS`.
+
+### Honest takeaway
+
+When releasing v0.1.4 I claimed comprehensive verification. The
+verify_ssl_pinning_idioms suite covered 9 idiom patterns but only on
+"happy" data shapes. The stress test in this release exercises every
+JVM primitive type, every common edge case, and the full hook lifecycle
+— which surfaced bugs that had been latent through five prior releases.
+The static-method-with-string-arg bug in particular would have hit
+real users immediately.
+
 ## [0.1.4] — 2026-05-04
 
 End-to-end verification round against every Frida idiom from the
