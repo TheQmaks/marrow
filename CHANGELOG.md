@@ -6,6 +6,53 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-05-05
+
+Self-driven third stress round (`tests/verify_stress3.py`) covering
+constructor `$new` with object args, multi-overload constructor
+dispatch, `Java.reload()` cycle stability, and hot-hook stress (1000
+invocations of a hooked primitive method). Surfaced one real bug.
+
+### Fixed
+
+- **`$new` was broken for multi-overload constructors.** Since v0.1.5
+  multi-overload methods are wrapped in callables (function-shaped, no
+  `$method` field). The `$new` body's `(typeof cls.$init === 'function')
+  ? cls.$init : Java._pickOverload(...)` ternary always took the first
+  branch when there were multiple constructors, then `Java.invoke`
+  failed with `cannot read property 'indexOf' of undefined` because
+  the callable lacks `$method.addr`. Now `$new` distinguishes single-
+  overload (has `$method`) from multi-overload (has `$overloads`) and
+  uses `_pickOverload` for the latter. `StringBuilder("hello")`,
+  `Integer.$new(42)`, and chained constructor calls now work.
+
+### Added
+
+- `tests/verify_stress3.py` — third-round stress: constructor with no
+  args / String arg / int arg, chained `sb.append(...)`, `Java.reload()`
+  cycle (install hook → reload → install again, no leak), 1000-invocation
+  hot-hook stress with both replacement and `callOriginal` paths.
+
+### Verified
+
+```
+verify_stress3 11/11 PASS on all 5 JDKs (55/55)
+verify_stress2 13/13 PASS on all 5 JDKs (65/65)
+verify_stress  34/34 PASS on all 5 JDKs (170/170)
+agent_smoke    24/24 PASS on all 5 JDKs (120/120)
+smoke_extended 22/22 PASS on JDK 17
+─────────────────────────────────────────────
+Total: ~410 checks across the matrix
+```
+
+### Honest takeaway
+
+Each new type-axis I cover finds bugs. This round: `$new` constructor
++ multi-overload interaction. Pattern holds: 1–3 latent bugs per axis
+expansion. Coverage axes still untouched: high-concurrency hook
+firing, long-running memory pressure, multi-dim arrays returned from
+custom Java code (stdlib doesn't naturally produce `[[X` types).
+
 ## [0.1.6] — 2026-05-05
 
 Self-driven second stress round (`tests/verify_stress2.py`) covering F/D

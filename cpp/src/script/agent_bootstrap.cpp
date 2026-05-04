@@ -333,9 +333,22 @@ R"JS(
                 throw new Error("$new: alloc failed for " + name);
             var inst = Java.cast(oop, name);
             if (cls.$init) {
-                var single = (typeof cls.$init === 'function')
-                           ? cls.$init
-                           : Java._pickOverload(cls.$init, args, name);
+                // Three flavours of cls.$init:
+                //   1. Single-overload constructor — `cls.$init.$method`
+                //      carries the address; use it directly.
+                //   2. Multi-overload callable (since v0.1.5) — has
+                //      $overloads but no $method; pick by arg shape.
+                //   3. Plain handle object (legacy path) — has
+                //      $overloads but is not callable; same as #2.
+                var single;
+                if (cls.$init.$method) {
+                    single = cls.$init;
+                } else if (cls.$init.$overloads) {
+                    single = Java._pickOverload(cls.$init, args, name);
+                } else {
+                    throw new Error("$new: cannot resolve constructor for " +
+                                    name);
+                }
                 Java.invoke(single, oop, args);
             }
             return inst;
