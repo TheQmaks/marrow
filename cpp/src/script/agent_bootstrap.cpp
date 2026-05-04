@@ -365,8 +365,41 @@ R"JS(
             single.overload = handle.overload;
             return single;
         }
-        return handle;
+        // Multi-overload: make the handle directly callable so
+        // `Cls.method(args)` / `instance.method(args)` work without
+        // explicit .overload(...). Frida's pattern: pick the overload
+        // whose param list matches the JS arg shape, then route through
+        // the resolved single. _pickOverload does the matching using
+        // the same logic as $new() constructor dispatch.
+        //
+        // .implementation = fn is unsupported on this multi-overload
+        // handle by design — replacing "all overloads" is ambiguous.
+        // User must say `Cls.method.overload("(I)V").implementation =`.
+        var callable = function() {
+            var args = Array.prototype.slice.call(arguments);
+            var picked = Java._pickOverload(handle, args, cls.$name);
+            return picked.apply(this, args);
+        };
+        callable.$name      = name;
+        callable.$overloads = overloads;
+        callable.$cls       = cls;
+        callable.overload   = handle.overload;
+        Object.defineProperty(callable, 'implementation', {
+            set: function() {
+                throw new Error(
+                    cls.$name + "." + name + " has " + overloads.length +
+                    " overloads — pick one explicitly: " +
+                    "Cls." + name + ".overload(\"sig\").implementation = fn. " +
+                    "Available signatures: " +
+                    overloads.map(function(o){return o.sig}).join(", "));
+            },
+            configurable: true
+        });
+        return callable;
     },
+)JS"
+// MSVC ~16K split.
+R"JS(
 
     _makeSingle: function(cls, name, m) {
         var addr = Java._parseHex(m.addr);
@@ -790,7 +823,16 @@ R"JS(
 
     // Decode JavaCalls "{type:N, value:0xV}" result into a useful JS value.
     // Bare strings or already-unwrapped values pass through unchanged.
-    _unwrap: function(r, returnClassName) {
+    _unwrap: function(r, returnTypeSig) {
+        // returnTypeSig is one of:
+        //   undefined / null  → no auto-cast (raw oop hex for T_OBJECT/T_ARRAY)
+        //   "java/lang/X"     → bare class name; for T_OBJECT, Java.cast applies
+        //   "[Ljava/lang/X;"  → array sig fragment; for T_ARRAY, _castArray applies
+        //   "[I", "[B", ...   → primitive-element array sig fragments
+        //
+        // Backward compat: callers that still pass a bare class name for
+        // T_OBJECT keep working. Array auto-cast only fires when the caller
+        // passes the full "[..." fragment.
         if (typeof r !== "string") return r;
         var m = r.match(/^\{type:(\d+),\s*value:0x([0-9a-f]+)\}$/);
         if (!m) return r;
@@ -806,26 +848,81 @@ R"JS(
             }
             case 11: return "0x" + hex;                // T_LONG (precision)
             case 6: case 7: return "0x" + hex;         // T_FLOAT/T_DOUBLE bits
-            case 12:                                   // T_OBJECT
+            case 12: case 13:                          // T_OBJECT / T_ARRAY
+                // The C++ JNI/JC surface emits type=12 for everything
+                // reference-typed including arrays; type=13 isn't actually
+                // produced. We dispatch on the return type signature
+                // string instead: leading '[' → array, otherwise plain
+                // class. Falls back to raw oop hex if the cast / array
+                // decode fails.
                 if (hex === "0") return null;
-                var oop = "0x" + hex;
-                // Frida-style auto-cast: when caller knows the return
-                // type's class name (from method signature), wrap the
-                // oop in an instance proxy. Falls back to raw oop hex
-                // if cast fails (e.g. class not loaded).
-                if (returnClassName) {
-                    try { return Java.cast(oop, returnClassName); }
-                    catch (e) { return oop; }
+                var ooph = "0x" + hex;
+                if (returnTypeSig) {
+                    try {
+                        return (returnTypeSig.charAt(0) === '[')
+                             ? Java._castArray(ooph, returnTypeSig)
+                             : Java.cast(ooph, returnTypeSig);
+                    } catch (e) { return ooph; }
                 }
-                return oop;
-            case 13:                                   // T_ARRAY
-                // Arrays returned as raw oop hex — caller can pass to
-                // another Java method (which accepts oop directly) or
-                // Java.array(...) helper for element-by-element decode.
-                return hex === "0" ? null : "0x" + hex;
+                return ooph;
             default: return r;
         }
     },
+
+    // Eagerly decode a Java array into a JS array enhanced with $oop,
+    // $length, $elementSig — supports both iteration ([i], length) and
+    // pass-through to other Java methods (their _coerceArg sees $oop).
+    //
+    // Element decode policy:
+    //   primitive arrays ([I, [B, [J, [D, ...) → Number per slot
+    //   object arrays ([Ljava/lang/X;)         → cast'd proxies per slot
+    //
+    // Bound at 4096 elements to keep one-shot decodes from blowing
+    // duktape memory on huge byte[] payloads. For larger arrays we keep
+    // $oop and $length set but $truncated=true; caller can chunk via
+    // Marrow._readArray(oop, kind, n) directly.
+    _castArray: function(oopHex, sigFragment) {
+        // sigFragment like "[Ljava/lang/String;" or "[B" or "[[I".
+        // Skip leading '['s to find the element kind.
+        var depth = 0;
+        while (depth < sigFragment.length && sigFragment.charAt(depth) === '[')
+            ++depth;
+        var elem = sigFragment.charAt(depth);
+        var elemClass = null;
+        if (elem === 'L') {
+            // Strip leading 'L' + trailing ';'.
+            elemClass = sigFragment.substring(depth + 1, sigFragment.length - 1);
+        }
+        var EAGER_LIMIT = 4096;
+        // Marrow._readArray returns null for invalid oops, an array
+        // otherwise. Type-letter argument matches the element kind.
+        var elemTypeChar = elem;
+        // Multi-dimensional arrays decode as object array (each elem is
+        // another array oop).
+        if (depth > 1) elemTypeChar = 'L';
+        var raw = null;
+        try { raw = Marrow._readArray(oopHex, elemTypeChar, EAGER_LIMIT); }
+        catch (e) { /* fall through with empty */ }
+        var out = (raw && raw.length) ? raw.slice() : [];
+        // For object-element arrays, decode each oop into a cast'd
+        // proxy. Skips nulls and oops we can't decode.
+        if (elemTypeChar === 'L' && elemClass) {
+            for (var i = 0; i < out.length; ++i) {
+                var v = out[i];
+                if (typeof v !== 'string' || v === '0x0') { out[i] = null; continue; }
+                try { out[i] = Java.cast(v, elemClass); }
+                catch (e) { /* leave raw */ }
+            }
+        }
+        out.$oop = oopHex;
+        out.$elementSig = sigFragment.substring(depth);
+        out.$depth = depth;
+        out.$truncated = (raw && raw.length === EAGER_LIMIT) ? true : false;
+        return out;
+    },
+)JS"
+// MSVC ~16K split point.
+R"JS(
 
     // Convert a Frida-style Java type string ("int", "java.lang.String",
     // "[Ljavax.net.ssl.KeyManager;") to a JVM-internal type signature
@@ -843,16 +940,20 @@ R"JS(
         return 'L' + t.replace(/\./g, '/') + ';';
     },
 
-    // Extract the return type's class name from a JVM method signature
-    // like "(II)Ljava/lang/String;" → "java/lang/String". Returns null
-    // for primitive returns (caller passes null to _unwrap → no cast).
-    // For arrays we also return null — auto-array-cast isn't implemented.
+    // Extract the return type's auto-cast hint from a JVM method
+    // signature. _unwrap discriminates by the leading char:
+    //   "(II)Ljava/lang/String;" → "java/lang/String" (bare class)
+    //   "(II)[Ljava/lang/X;"     → "[Ljava/lang/X;"   (array sig fragment)
+    //   "(II)[I"                 → "[I"               (prim array fragment)
+    //   "(II)I"                  → null               (primitive — no cast)
+    //   "(II)V"                  → null               (void)
     _returnClassFromSig: function(sig) {
         var rp = sig.indexOf(')');
         if (rp < 0) return null;
         var ret = sig.substring(rp + 1);
         if (ret.charAt(0) === 'L' && ret.charAt(ret.length - 1) === ';')
             return ret.substring(1, ret.length - 1);
+        if (ret.charAt(0) === '[') return ret;       // array sig — full fragment
         return null;
     },
 )JS"
@@ -1075,13 +1176,21 @@ R"JS(
     // Like _bindMethod but reads the receiver from `this.$oop` at call
     // time instead of capturing it in a closure. Lives on a Java.cast
     // prototype so all instances of the same class share the same bound
-    // function.
+    // function. Handles both single-overload and multi-overload handles —
+    // for the latter we re-pick on every call based on JS arg shapes.
     _bindMethodOnThis: function(handle) {
+        var isMulti = handle && handle.$overloads &&
+                      handle.$overloads.length > 1 &&
+                      !handle.$method;  // single has $method, multi doesn't
         var bound = function() {
             var args = Array.prototype.slice.call(arguments);
             var thisOop = this && this.$oop ? this.$oop : "0x0";
-            return Java._unwrap(Java.invoke(handle, thisOop, args),
-                                  handle.$returnClass);
+            var resolved = isMulti
+                ? Java._pickOverload(handle, args,
+                                       handle.$cls && handle.$cls.$name || '?')
+                : handle;
+            return Java._unwrap(Java.invoke(resolved, thisOop, args),
+                                  resolved.$returnClass);
         };
         bound.$bound        = true;
         bound.$method       = handle.$method;
@@ -1561,13 +1670,28 @@ R"JS(
         }
         return { lo: 0, hi: 0 };
     },
-    // Coerce a JS value to the form _invokeJC expects:
+    // Coerce a JS value to the form _invokeJC / _invokeJNI expect:
     //   primitives → JS Number / String unchanged
     //   instance proxy {$oop} → its oop hex string
+    //   plain JS string ("hello") → auto-allocated Java String oop
+    //   "0x..." hex string → unchanged (raw oop)
     //   anything else → unchanged (caller's problem)
+    //
+    // The plain-string allocation is what makes Frida-style calls like
+    // `cf.generateCertificate(bis); cf.toString()` and
+    // `keyStore.setCertificateEntry("ca", ca)` work without manual
+    // Java._jstring sprinkles. _jstring requires the JavaCalls path —
+    // when unavailable we leave the string as-is and let the C++ side
+    // surface whatever error the underlying method throws.
     _coerceArg: function(v) {
         if (v && typeof v === 'object' && typeof v.$oop === 'string')
             return v.$oop;
+        if (typeof v === 'string' && v.indexOf('0x') !== 0) {
+            try {
+                var oop = Java._jstring(v);
+                if (oop) return oop;
+            } catch (e) { /* fall through with original string */ }
+        }
         return v;
     },
     _coerceArgs: function(arr) {

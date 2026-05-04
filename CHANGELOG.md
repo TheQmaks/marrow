@@ -6,6 +6,54 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-05-04
+
+Drops the last two known Frida-parity holes from the v0.1.1 release notes:
+**array auto-proxy** and **JS-string -> Java-String implicit allocation in
+arg position**. Plus a real bug: multi-overload methods on a `Java.use`
+class were objects (not callable functions), so `s.split(...)` /
+`s.getBytes()` only worked through explicit `.overload(...)` chains —
+fixed via auto arg-shape dispatch.
+
+### Added
+
+- `Java.cast` and method invocations now auto-decode array returns into
+  enhanced JS arrays. `s.getBytes()` returns a `[N1, N2, ...]` whose
+  `length` works, `[i]` works, plus `$oop`/`$elementSig`/`$truncated` are
+  set so the same array can be passed back to another Java method
+  unchanged. Object arrays decode each element via `Java.cast`. Eager
+  decode capped at 4096 elements to keep huge byte[] payloads from
+  blowing duktape memory; beyond that the array is truncated and
+  `$truncated=true`.
+- JS-string arguments to Java method calls now auto-allocate a Java
+  String. Previously you had to wrap with `Java._jstring("hello")`
+  manually; now `keyStore.setCertificateEntry("ca", ca)` works as in a
+  vanilla Frida script. `_coerceArg` first tries `_jstring`; if the
+  JavaCalls path isn't reachable, the original JS string is left
+  unchanged so the C++ side can surface a useful error.
+- Multi-overload methods (5+ overloads on `String`, `StringBuilder`, etc.)
+  are now directly callable. Calling `Cls.method(args)` resolves through
+  `_pickOverload` based on JS arg shapes and routes to the matching
+  signature. Explicit `.overload("(I)V")` still works.
+  `.implementation =` on a multi-overload handle throws with a clear
+  error message ("pick one explicitly: Cls.method.overload(\"sig\")")
+  because replacing all overloads at once is ambiguous.
+
+### Fixed
+
+- `_unwrap` now correctly decodes array returns when the JNI/JC C++
+  surface emits T_OBJECT (type=12) for them, not just T_ARRAY (type=13)
+  which is no longer produced by the underlying invoke paths. Cases 12
+  and 13 share dispatch keyed off the return-type signature's leading
+  `[`.
+
+### Verified
+
+- `tests/verify_array_and_strarg.py` — covers the new behaviours.
+- `tests/verify_frida_parity.py` — v0.1.1 gaps still PASS.
+- `tests/verify_autocast.py` — handler-side L-arg cast still PASS.
+- `agent_smoke 24/24 PASS · smoke_extended 22/22 PASS` on JDK 8/11/17/21/25.
+
 ## [0.1.2] — 2026-05-04
 
 Performance fix for the v0.1.1 L-return auto-cast: `Java.cast` now caches
