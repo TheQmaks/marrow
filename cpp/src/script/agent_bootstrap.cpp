@@ -313,15 +313,47 @@ R"JS(
             $name: name,
             $overloads: overloads,
             $cls: cls,
-            // .overload("(I)V") -> single-method handle
-            overload: function(sig) {
+            // Two calling conventions, both Frida-compatible:
+            //
+            //   .overload("(II)V")               // single JVM-internal sig
+            //   .overload("int", "int")          // variadic Frida type names
+            //   .overload("[Ljavax.net.ssl.KeyManager;", ...)
+            //
+            // The variadic form matches by argument list only (return type
+            // is whatever the matching overload declares). Equivalent to
+            // how Frida resolves overloads in copy-pasted Android scripts.
+            overload: function() {
                 var hit = null;
-                for (var i = 0; i < overloads.length; ++i)
-                    if (overloads[i].sig === sig) { hit = overloads[i]; break; }
-                if (!hit) throw new Error(
-                    "no overload " + sig + " of " + cls.$name + "." + name +
-                    "; available: " +
-                    overloads.map(function(o){return o.sig}).join(", "));
+                if (arguments.length === 1 &&
+                    typeof arguments[0] === 'string' &&
+                    arguments[0].charAt(0) === '(') {
+                    // JVM-internal sig: full match including return type.
+                    var sig = arguments[0];
+                    for (var i = 0; i < overloads.length; ++i)
+                        if (overloads[i].sig === sig) { hit = overloads[i]; break; }
+                } else {
+                    // Frida-style variadic: build "(...)" arg fragment and
+                    // match overloads by arg list, ignoring return type.
+                    var parts = [];
+                    for (var i = 0; i < arguments.length; ++i)
+                        parts.push(Java._fridaTypeToJvm(arguments[i]));
+                    var argsBody = '(' + parts.join('') + ')';
+                    for (var i = 0; i < overloads.length; ++i)
+                        if (overloads[i].sig.indexOf(argsBody) === 0) {
+                            hit = overloads[i]; break;
+                        }
+                }
+                if (!hit) {
+                    var asked = (arguments.length === 1 &&
+                                 arguments[0].charAt(0) === '(')
+                              ? arguments[0]
+                              : '(' + Array.prototype.slice.call(arguments)
+                                          .join(', ') + ')';
+                    throw new Error(
+                        "no overload " + asked + " of " +
+                        cls.$name + "." + name + "; available: " +
+                        overloads.map(function(o){return o.sig}).join(", "));
+                }
                 return Java._makeSingle(cls, name, hit);
             }
         };
@@ -358,11 +390,15 @@ R"JS(
                 // Pass `single` as `this` so callOriginal sees `this.$cookie`.
                 return single.callOriginal.apply(single, args);
             }
-            return Java._unwrap(Java.invokeStatic(single, args));
+            return Java._unwrap(Java.invokeStatic(single, args),
+                                  single.$returnClass);
         };
 
         single.argumentTypes = argTypes;
         single.returnType    = retType;
+        // Frida-parity: auto-cast L-typed returns. Null for primitive /
+        // void / array returns — _unwrap then leaves the value as-is.
+        single.$returnClass  = Java._returnClassFromSig(m.sig);
         // Carry class + method metadata so Java.invokeStatic can route
         // through the JNI surface when PDB is unavailable. Frida-style
         // direct calls `Cls.method(args)` then work without setup.
@@ -754,7 +790,7 @@ R"JS(
 
     // Decode JavaCalls "{type:N, value:0xV}" result into a useful JS value.
     // Bare strings or already-unwrapped values pass through unchanged.
-    _unwrap: function(r) {
+    _unwrap: function(r, returnClassName) {
         if (typeof r !== "string") return r;
         var m = r.match(/^\{type:(\d+),\s*value:0x([0-9a-f]+)\}$/);
         if (!m) return r;
@@ -770,12 +806,58 @@ R"JS(
             }
             case 11: return "0x" + hex;                // T_LONG (precision)
             case 6: case 7: return "0x" + hex;         // T_FLOAT/T_DOUBLE bits
-            case 12: case 13:                          // T_OBJECT/T_ARRAY
+            case 12:                                   // T_OBJECT
+                if (hex === "0") return null;
+                var oop = "0x" + hex;
+                // Frida-style auto-cast: when caller knows the return
+                // type's class name (from method signature), wrap the
+                // oop in an instance proxy. Falls back to raw oop hex
+                // if cast fails (e.g. class not loaded).
+                if (returnClassName) {
+                    try { return Java.cast(oop, returnClassName); }
+                    catch (e) { return oop; }
+                }
+                return oop;
+            case 13:                                   // T_ARRAY
+                // Arrays returned as raw oop hex — caller can pass to
+                // another Java method (which accepts oop directly) or
+                // Java.array(...) helper for element-by-element decode.
                 return hex === "0" ? null : "0x" + hex;
             default: return r;
         }
     },
 
+    // Convert a Frida-style Java type string ("int", "java.lang.String",
+    // "[Ljavax.net.ssl.KeyManager;") to a JVM-internal type signature
+    // letter / fragment ("I", "Ljava/lang/String;", "[Ljavax/net/ssl/KeyManager;").
+    // Used by .overload(...) variadic form.
+    _fridaTypeToJvm: function(t) {
+        var prim = {
+            "void": "V", "int": "I", "long": "J", "double": "D", "float": "F",
+            "byte": "B", "char": "C", "short": "S", "boolean": "Z"
+        };
+        if (Object.prototype.hasOwnProperty.call(prim, t)) return prim[t];
+        // Already an array signature (starts with '[') — just slash it.
+        if (t.charAt(0) === '[') return t.replace(/\./g, '/');
+        // Plain class name in dotted or slashed form → wrap as Lname;.
+        return 'L' + t.replace(/\./g, '/') + ';';
+    },
+
+    // Extract the return type's class name from a JVM method signature
+    // like "(II)Ljava/lang/String;" → "java/lang/String". Returns null
+    // for primitive returns (caller passes null to _unwrap → no cast).
+    // For arrays we also return null — auto-array-cast isn't implemented.
+    _returnClassFromSig: function(sig) {
+        var rp = sig.indexOf(')');
+        if (rp < 0) return null;
+        var ret = sig.substring(rp + 1);
+        if (ret.charAt(0) === 'L' && ret.charAt(ret.length - 1) === ';')
+            return ret.substring(1, ret.length - 1);
+        return null;
+    },
+)JS"
+// MSVC ~16K split point — concatenation joins next fragment.
+R"JS(
     // Pick the overload whose signature matches the JS argument shape.
     // Match rules: arg count must match, and each JS arg's "kind"
     // (number / string-as-hex-oop / boolean) must align with the
@@ -840,12 +922,14 @@ R"JS(
     _bindMethod: function(handle, oopHex) {
         var bound = function() {
             var args = Array.prototype.slice.call(arguments);
-            return Java._unwrap(Java.invoke(handle, oopHex, args));
+            return Java._unwrap(Java.invoke(handle, oopHex, args),
+                                  handle.$returnClass);
         };
-        bound.$bound       = true;
-        bound.$boundOop    = oopHex;
-        bound.$method      = handle.$method;
-        bound.$sig         = handle.$sig;
+        bound.$bound        = true;
+        bound.$boundOop     = oopHex;
+        bound.$method       = handle.$method;
+        bound.$sig          = handle.$sig;
+        bound.$returnClass  = handle.$returnClass;
         bound.argumentTypes = handle.argumentTypes;
         bound.returnType    = handle.returnType;
         return bound;
@@ -875,8 +959,21 @@ R"JS(
     // once per class lifetime. Frida-equivalent throughput on hot hooks.
     _classFieldsCache: {},
 
-    cast: function(oopHex, className) {
+    cast: function(oopHex, classRef) {
+        // Accept either a class name string ("java/lang/String" or
+        // "java.lang.String") or a Java.use'd handle (whose $name carries
+        // the JVM-internal slashed form). Frida-style: Java.cast(oop, T)
+        // where T = Java.use(...) is common in copy-pasted scripts.
+        var className = (typeof classRef === 'string')
+            ? classRef
+            : (classRef && classRef.$name ? classRef.$name : null);
+        if (!className)
+            throw new Error("Java.cast: second arg must be a class name " +
+                            "string or a Java.use() handle");
         var cls = Java.use(className);
+        // Java.use accepts dotted; cls.$name is normalized slashed. Use
+        // that downstream so field cache / klass lookup are stable.
+        className = cls.$name;
         var instance = {
             $oop: oopHex,
             $class: className,
@@ -1485,7 +1582,8 @@ R"JS(
                           ? sig.charAt(rp + 1) : "V";
                 if (ret === "[") ret = "L";
                 return Java._unwrap(Marrow._invokeJC(
-                    addr.lo, addr.hi, ret, argLetters, argv, thisOop));
+                    addr.lo, addr.hi, ret, argLetters, argv, thisOop),
+                    method.$returnClass || Java._returnClassFromSig(sig));
             }
         }
         var a0 = Java._argToLoHi(argv[0]),
@@ -1515,7 +1613,8 @@ R"JS(
                           || p.ret === 'L' || p.ret === '[';
             if (!hasObj) {
                 return Java._unwrap(Marrow._invokeJNI(
-                    method.$class, method.$method.name, sig, p.ret, args || []));
+                    method.$class, method.$method.name, sig, p.ret, args || []),
+                    method.$returnClass || Java._returnClassFromSig(sig));
             }
             // Falls through to JavaCalls path for oop args.
         }
@@ -1557,7 +1656,8 @@ R"JS(
                           ? sig.charAt(rp + 1) : "V";
                 if (ret === "[") ret = "L";
                 return Java._unwrap(Marrow._invokeJC(
-                    addr.lo, addr.hi, ret, argLetters, argv));
+                    addr.lo, addr.hi, ret, argLetters, argv),
+                    method.$returnClass || Java._returnClassFromSig(sig));
             }
             // fall through to legacy thunk if oop args present.
         }

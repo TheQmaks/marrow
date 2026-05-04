@@ -6,6 +6,44 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-05-04
+
+Frida-parity polish for `Java.use` / `Java.cast` / `.overload`. Real-world
+Android instrumentation scripts (SSL repinning, certificate pinning bypass,
+WebView hooks, etc.) now copy-paste with minimal adaptation — generally
+just substituting `Marrow.*` for `JvmProbe.*` references if any.
+
+### Added
+
+- `.overload(typeStr1, typeStr2, ...)` variadic Frida-style. Accepts a list
+  of Java type names (`"int"`, `"java.lang.String"`,
+  `"[Ljavax.net.ssl.KeyManager;"`) and resolves to the matching overload by
+  argument list. The existing `.overload("(II)V")` JVM-internal-sig form
+  still works.
+- L-typed return auto-cast. `var s = Integer.toString(42)` now returns a
+  `Java.cast` proxy with direct field access (`s.value`,
+  `Java.toString(s.$oop)`), instead of a raw oop hex string. Threaded
+  through `Java.invoke`, `Java.invokeStatic`, `_makeSingle`, and
+  `_bindMethod` via the new `_returnClassFromSig` helper.
+- `Java.cast(oop, ClassRef)` accepts a `Java.use(...)` handle as the
+  second argument (not only a class name string). Frida scripts often
+  write `Java.cast(oop, X509Certificate)` — that now works.
+
+### Fixed
+
+- Documentation: `docs/GETTING_STARTED.md` scenario 5 was using the
+  low-level `Marrow.readField` primitive on an L-typed handler arg. That
+  code would fail at runtime — auto-cast on `.implementation` already
+  yields a proxy, so `arg.length` is the correct usage. Doc now matches
+  what the engine actually does.
+
+### Verified
+
+- `tests/verify_frida_parity.py` — covers all three new behaviours.
+- `tests/verify_autocast.py` — regression guard for sync handler L-arg
+  cast.
+- `agent_smoke 24/24 PASS · smoke_extended 22/22 PASS` on JDK 8/11/17/21/25.
+
 ## [0.1.0] — 2026-05-04
 
 First public release.
