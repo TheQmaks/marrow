@@ -167,9 +167,11 @@ The killer feature. Edit your script, push it again, all hooks from the
 previous push are torn down automatically before the new one is evaluated.
 
 ```js
-// dev.js — first version
-Java.use('App').handlePacket.implementation = function(arg) {
-    Marrow.log('packet len=' + Marrow.readField(arg, 'Packet', 'length'));
+// dev.js — first version. `packet` is auto-cast to a Java.cast proxy
+// for L-typed args, so field access is direct: packet.length, no
+// readField boilerplate.
+Java.use('App').handlePacket.implementation = function(packet) {
+    Marrow.log('packet len=' + packet.length);
 };
 ```
 
