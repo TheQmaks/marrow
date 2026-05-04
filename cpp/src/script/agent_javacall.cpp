@@ -194,6 +194,12 @@ static JniCallResult seh_jni_call(void* fn_va, char ret_c, void* env,
 namespace marrow {
 namespace {
 
+// Forward decls — implementations live further down. js_invokeJC uses
+// jc_pending_exception_via_jni at its main path; without forward-decl
+// C++ wouldn't see it.
+static bool jc_check_pending_exception(uint64_t pe_addr);
+static bool jc_pending_exception_via_jni();
+
 // ---------------------------------------------------------------------------
 // Symbol cache. Resolved once via DbgHelp from jvm.dll on first invokeJC().
 // ---------------------------------------------------------------------------
@@ -853,6 +859,16 @@ duk_ret_t js_invokeJC(duk_context* ctx) {
         seh_set_thread_state(thread, state_off, orig_state);
 
     if (threw) { duk_push_string(ctx, "java_exception"); return 1; }
+
+    // Java exceptions (NumberFormatException etc.) survive seh_jc_call
+    // without raising an SEH exception. JNI's ExceptionCheck on the
+    // current JNIEnv detects them — same path js_invokeJNI uses. On
+    // hit we surface "java_exception" so _unwrap turns it into a
+    // JS-side throw.
+    if (jc_pending_exception_via_jni()) {
+        duk_push_string(ctx, "java_exception");
+        return 1;
+    }
 
     // Decode JavaValue. Layout (verified for JDK 21):
     //   [0..3]  = BasicType (int enum). T_VOID=0/14, T_INT=10, T_LONG=11, etc
@@ -1538,6 +1554,49 @@ static bool seh_call_stub(void* fn_va, intptr_t* result, int rtype,
     } __except (EXCEPTION_EXECUTE_HANDLER) { return true; }
 }
 
+// SEH-isolated read+clear of Thread::_pending_exception. Caller does
+// the std::string-creating field lookup (which would force a destructor
+// in this scope and prevent __try). We get a raw byte offset.
+__declspec(noinline)
+static bool jc_check_pending_exception(uint64_t pe_addr) {
+    bool had_pending = false;
+    __try {
+        uint64_t pending = *reinterpret_cast<volatile uint64_t*>(pe_addr);
+        if (pending) {
+            *reinterpret_cast<volatile uint64_t*>(pe_addr) = 0;
+            had_pending = true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { /* swallow */ }
+    return had_pending;
+}
+
+// Combined: check whether Java has a pending exception via the JNIEnv
+// vtable (same path js_invokeJNI uses). vmStructs doesn't expose
+// Thread::_pending_exception on every JDK we care about (JDK 17 in
+// particular omits it), so the direct field-read approach via Thread
+// would silently no-op there. JNI's ExceptionCheck reads the same
+// underlying field but goes through the JVM's blessed entry point.
+__declspec(noinline)
+static bool jc_pending_exception_via_jni() {
+    void* env = current_jnienv();
+    if (!env) return false;
+    void** vtable = seh_read_vtable(env);
+    if (!vtable) return false;
+    auto exception_check = reinterpret_cast<JniExceptionCheckFn>(
+        *reinterpret_cast<void**>(reinterpret_cast<char*>(vtable) + JNI_ExceptionCheck));
+    auto exception_clear = reinterpret_cast<JniExceptionClearFn>(
+        *reinterpret_cast<void**>(reinterpret_cast<char*>(vtable) + JNI_ExceptionClear));
+    if (!exception_check) return false;
+    bool had = false;
+    __try {
+        if (exception_check(env)) {
+            if (exception_clear) exception_clear(env);
+            had = true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { had = false; }
+    return had;
+}
+
 // SEH-isolated read of `_from_interpreted_entry` from a Method*.
 __declspec(noinline)
 static void* seh_read_method_entry(uint64_t method_ptr, size_t off) {
@@ -1701,6 +1760,17 @@ duk_ret_t js_invokeViaCallStub(duk_context* ctx) {
                                 psize ? params_buf : nullptr, psize,
                                 thread);
     if (threw) { duk_push_string(ctx, "java_exception"); return 1; }
+
+    // Java exceptions are stored on Thread::_pending_exception without
+    // raising an SEH exception in native code. After call_stub returns
+    // "successfully", check the field to know whether the call really
+    // completed or threw a Throwable. Resolve the offset HERE (where
+    // it's safe to use std::string for the field lookup) and pass a
+    // raw address into the SEH-protected helper.
+    if (jc_pending_exception_via_jni()) {
+        duk_push_string(ctx, "java_exception");
+        return 1;
+    }
 
     char out[96];
     std::snprintf(out, sizeof(out), "{type:%d, value:0x%llx}",

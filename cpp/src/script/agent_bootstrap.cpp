@@ -279,6 +279,37 @@ R"JS(
             if (!has.call(byName, m.name)) byName[m.name] = [];
             byName[m.name].push(m);
         }
+        // Walk the superclass chain and merge inherited methods.
+        // Frida's Java.use exposes inherited methods; without this,
+        // String proxy is missing getClass / hashCode / toString
+        // (instance) / equals etc. from Object. Subclass methods take
+        // precedence — same name on this class shadows the inherited
+        // overloads (Java method override semantics).
+        try {
+            var supers = Marrow._klassSupers(k) || [];
+            for (var si = 0; si < supers.length; ++si) {
+                var sname = supers[si];
+                if (!sname) continue;
+                var superCls;
+                try { superCls = Java.use(sname); }
+                catch (e) { continue; }
+                // For each method that exists on the super, only add
+                // overloads whose name isn't already declared on a
+                // closer class. Simpler approximation: skip the name
+                // entirely if already present (subclass methods shadow
+                // ALL inherited overloads).
+                if (superCls && superCls.$klass) {
+                    var supMethods = Marrow.listMethods(superCls.$klass) || [];
+                    for (var smi = 0; smi < supMethods.length; ++smi) {
+                        var sm = supMethods[smi];
+                        if (has.call(byName, sm.name)) continue;
+                        if (sm.name === '<init>' || sm.name === '<clinit>') continue;
+                        if (!has.call(byName, sm.name)) byName[sm.name] = [];
+                        byName[sm.name].push(sm);
+                    }
+                }
+            }
+        } catch (e) { /* fall through with declared-only methods */ }
         var cls = { $name: name, $klass: k };
         var self = this;
         // For each method name, install a property that returns a method
@@ -842,6 +873,9 @@ R"JS(
         return oopHex;
     },
 
+)JS"
+// MSVC ~16K split.
+R"JS(
     // Decode JavaCalls "{type:N, value:0xV}" result into a useful JS value.
     // Bare strings or already-unwrapped values pass through unchanged.
     _unwrap: function(r, returnTypeSig) {
@@ -863,6 +897,12 @@ R"JS(
         // methods (success status, no value to wrap). Map to JS undefined
         // so user code matches Frida semantics: void method → undefined.
         if (r === "ok") return undefined;
+        // C++ surfaces a Java Throwable as the literal "java_exception".
+        // Throw a JS Error so user `try/catch` sees it, matching Frida
+        // semantics where Java exceptions propagate as JS errors.
+        if (r === "java_exception") {
+            throw new Error("Java exception thrown");
+        }
         var m = r.match(/^\{type:(\d+),\s*value:0x([0-9a-f]+)\}$/);
         if (!m) {
             // Bare "value:0xX" form. Decode by sig.
@@ -899,7 +939,27 @@ R"JS(
                 return n;
             }
             case 11: return "0x" + hex;                // T_LONG (precision)
-            case 6: case 7: return "0x" + hex;         // T_FLOAT/T_DOUBLE bits
+            case 6: {                                  // T_FLOAT
+                // hex carries the 32-bit IEEE 754 bit pattern. Decode
+                // to a JS number via DataView. Up to ~7 decimal digits
+                // of precision — same as Java's float.
+                var fb = parseInt(hex.slice(-8), 16);
+                var fab = new ArrayBuffer(4);
+                new DataView(fab).setUint32(0, fb, false);
+                return new DataView(fab).getFloat32(0, false);
+            }
+            case 7: {                                  // T_DOUBLE
+                // hex carries the 64-bit IEEE 754 bit pattern. Decode
+                // via two u32 halves (DataView lacks setUint64 in
+                // Duktape's ES5 mode). Returns full double precision.
+                var dab = new ArrayBuffer(8);
+                var ddv = new DataView(dab);
+                var hh  = hex.length > 8 ? hex.slice(0, hex.length - 8) : '0';
+                var ll  = hex.slice(-8);
+                ddv.setUint32(0, parseInt(hh, 16), false);
+                ddv.setUint32(4, parseInt(ll, 16), false);
+                return ddv.getFloat64(0, false);
+            }
             case 12: case 13:                          // T_OBJECT / T_ARRAY
                 // The C++ JNI/JC surface emits type=12 for everything
                 // reference-typed including arrays; type=13 isn't actually

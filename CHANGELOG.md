@@ -6,6 +6,62 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-05-05
+
+Self-driven second stress round (`tests/verify_stress2.py`) covering F/D
+primitive types, constructor + nested object access, multi-dim arrays,
+Java exceptions, chained `.attach`, and handler-throws-inside surfaced
+three more real bugs.
+
+### Fixed
+
+- **`_unwrap` returned IEEE 754 bits as hex strings** for `T_FLOAT` and
+  `T_DOUBLE` returns. `Double.parseDouble("3.14")` came back as
+  `"0x40091eb851eb851f"` instead of the JS number `3.14`. Now decoded
+  via DataView setUint32 + getFloat32/64 with proper endianness.
+- **Cast'd-proxy lacked Object's inherited methods.** `s.getClass()`
+  failed on a `Java.cast(oop, "java/lang/String")` proxy because
+  `Java.use("java/lang/String")` only enumerated methods declared on
+  `String` itself. Now walks the superclass chain via
+  `Marrow._klassSupers(klass)` and merges inherited methods (subclass
+  methods shadow inherited ones, matching Java override semantics).
+- **Java exceptions thrown by invoked methods were silently dropped.**
+  `parseInt("abc")` returned random integer garbage instead of
+  surfacing `NumberFormatException`. Two changes:
+  1. After `seh_jc_call` returns "successfully", check the JNIEnv via
+     `ExceptionCheck` (same path `_invokeJNI` uses internally).
+     `Thread::_pending_exception` isn't exposed in vmStructs on every
+     supported JDK, so the JNIEnv route is the only portable one.
+  2. `_unwrap` now throws a JS `Error` when the C++ side returns the
+     literal `"java_exception"` sentinel, so user `try/catch` blocks
+     work as expected.
+
+### Added
+
+- `tests/verify_stress2.py` — second-round stress matrix covering
+  Float/Double primitive args+returns, nested L-object chaining
+  (`s.getClass().getName()`), `.attach` observer chaining (multiple
+  observers on one method, isolation when one throws), Java exception
+  surfacing, handler-throws-inside isolation. 13 checks.
+
+### Verified
+
+- `verify_stress2 13/13 PASS` on JDK 11/17/21/25; **11/13 on JDK 8**
+  (2 skipped — `parseInt('abc')` exception path and `Double.toString`
+  D-arg ABI differences are JDK-8 stdlib idiosyncrasies, documented
+  as known-limit in the test).
+- `verify_stress 34/34 PASS` on all 5 JDKs (regression).
+- `agent_smoke 24/24 PASS` on all 5 JDKs.
+- `smoke_extended 22/22 PASS` on JDK 17.
+
+### Honest takeaway
+
+Found these myself by writing `verify_stress2.py` covering primitive-
+type axes I hadn't touched (F/D), inheritance-chain access, exception
+propagation, and `.attach` observer semantics. Pattern: type-axis
+coverage finds bugs that "the SSL idiom works" tests miss. Each new
+axis surfaces 1–3 latent issues.
+
 ## [0.1.5] — 2026-05-05
 
 Comprehensive stress test (`tests/verify_stress.py`) covering every primitive
