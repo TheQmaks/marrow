@@ -1,0 +1,32 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{cpp,hpp,h,c,cc,cxx}]
+indent_size = 4
+
+[*.py]
+indent_size = 4
+max_line_length = 100
+
+[*.{js,json}]
+indent_size = 2
+
+[*.{md,yml,yaml}]
+indent_size = 2
+trim_trailing_whitespace = false   # markdown: trailing spaces == hard break
+
+[*.{ps1,bat,cmd}]
+end_of_line = crlf
+
+[*.sh]
+end_of_line = lf
+
+[Makefile]
+indent_style = tab

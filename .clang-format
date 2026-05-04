@@ -1,0 +1,56 @@
+# Clang-Format declaration of the C++ style used by Marrow's agent + CLI.
+# This file is *advisory*: there is no CI gate enforcing it. It exists so
+# that contributors' editors auto-format new code consistently with the
+# pre-existing layout, without us having to run a one-shot reformat that
+# would explode every diff.
+#
+# To apply manually:  clang-format -i cpp/src/path/to/file.cpp
+
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: c++17
+
+ColumnLimit: 100
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+
+# Brace placement: K&R-style for functions, attached braces for control flow.
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Empty
+
+# Spacing.
+SpaceBeforeParens: ControlStatements
+SpacesInParentheses: false
+SpaceAfterCStyleCast: false
+SpacesBeforeTrailingComments: 2
+
+# Pointers and references attached to type, not name.
+PointerAlignment: Left
+ReferenceAlignment: Left
+DerivePointerAlignment: false
+
+# Includes: keep blocks the author wrote, sort within each block.
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+
+# Don't touch existing line breaks aggressively — we have hand-tuned ones.
+AllowAllArgumentsOnNextLine: true
+BinPackArguments: true
+BinPackParameters: true
+
+# Namespaces: closing comment auto-added by clang-format.
+FixNamespaceComments: true
+NamespaceIndentation: None
+
+# Penalties tuned to match existing code: prefer staying within column
+# limit even when it means breaking long argument lists.
+PenaltyBreakAssignment: 50
+PenaltyExcessCharacter: 100
+
+# Comment line break — preserve author's intent.
+ReflowComments: false

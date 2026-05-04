@@ -1,0 +1,87 @@
+[project]
+name = "marrow"
+version = "0.1.0"
+description = "Frida-equivalent dynamic instrumentation for HotSpot JVMs (Python out-of-process layer + C++ agent)."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+
+# This project ships as a working tree, not a PyPI distribution. The
+# [project] table is here for tooling (ruff, IDE) — there is intentionally
+# no [build-system] / wheel target.
+
+# ---------------------------------------------------------------------------
+# Ruff: linter + formatter for the Python out-of-process layer.
+# Run from repo root:
+#   ruff check .          # lint
+#   ruff format .         # format (off by default, opt-in)
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = [
+    "cpp/build",
+    "cpp/third_party",
+    "tests/target/build",
+    "**/__pycache__",
+]
+
+[tool.ruff.lint]
+# Conservative starter set — catches real bugs and unused code,
+# avoids stylistic noise. Opt into more (D, ANN, PTH) once the codebase
+# stabilises.
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes (unused imports, undefined names — high-signal)
+    "I",     # isort (import order)
+    "B",     # flake8-bugbear (mutable default args, useless try, etc.)
+    "UP",    # pyupgrade (e.g. f-string over .format)
+    "SIM",   # flake8-simplify
+    "RUF",   # ruff-specific rules
+]
+ignore = [
+    "E501",   # line-too-long: enforced softly via fmt, not as error
+    "B008",   # function calls in default args — common in our path-resolver helpers
+    "SIM105", # try/except/pass — context-suppress is uglier in many of our cases
+    "SIM108", # ternary preference — sometimes if/else is clearer
+    "UP015",  # mode='r' explicit — fine in tutorials
+    "RUF002", # ambiguous Unicode in docstrings — `×`/`–` are intentional
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Demos prioritise compact readability over lint perfection: `try: x` style
+# one-liners, top-level prints, unused names in didactic scaffolding, broad
+# excepts. The author chose this compact style deliberately for demos.
+"examples/python/*.py" = [
+    "E701", "E702",          # multiple-statements (compact `try: x` demo style)
+    "E401",                  # multiple imports on one line
+    "E402", "F401", "F841", "E722", "B007", "SIM102", "RUF005",
+]
+# Smoke tests share the demo style + side-effect-only imports.
+"tests/*.py" = [
+    "E701", "E702", "E401", "E402", "F401", "E722",
+    "RUF005",                # list concat is fine for one-shot CLI args
+    "RUF059",                # unused tuple unpacks (test plumbing reads partial returns)
+    "B007",                  # unused loop variable in summary print loops
+]
+# Tight aligned column-formatted print blocks (probe.py:128-130) and
+# accumulator updates (signature.py) — author's deliberate vertical layout.
+"probe.py"     = ["E701"]
+"signature.py" = ["E702"]
+# Top-level Python API uses flat from-imports; don't enforce isort grouping.
+"*.py" = ["I001"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "vm_meta", "walker", "oop_reader", "field_reader", "string_reader",
+    "zgc", "heap_walker", "method_walker", "injector", "remote",
+    "signature", "barriers", "cpcache", "cp_scanner", "hooks",
+    "metaspace", "probe", "satb", "tlab", "watchers",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"

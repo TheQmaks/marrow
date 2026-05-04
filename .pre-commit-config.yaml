@@ -1,0 +1,39 @@
+# Run before each commit:  pre-commit run --all-files
+# Install hooks:           pre-commit install
+#
+# Optional — Marrow has no CI gate enforcing pre-commit, but contributors
+# who install it will catch the same issues before pushing.
+
+repos:
+  # General hygiene.
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: ['--fix=crlf']
+        files: '\.(ps1|bat|cmd)$'
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+        files: '\.(sh|py|cpp|hpp|h|c|cmake|md|js|json|yml|yaml)$'
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=4096']  # Duktape amalgamation is ~3.6MB
+
+  # Python: ruff (linter + formatter).
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.1
+    hooks:
+      - id: ruff
+        args: [--fix]
+      # Formatter is intentionally left out — opt-in once the team agrees
+      # on a one-shot reformat. Until then ruff format would explode diffs.
+
+  # Shell: shellcheck.
+  - repo: https://github.com/koalaman/shellcheck-precommit
+    rev: v0.10.0
+    hooks:
+      - id: shellcheck
