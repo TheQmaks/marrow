@@ -6,6 +6,47 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-05-04
+
+Performance fix for the v0.1.1 L-return auto-cast: `Java.cast` now caches
+its proxy *prototype* per class instead of rebuilding the field-accessor
+table on every cast. Real-world Frida hot hooks no longer pay a 51x
+slowdown for proxy construction.
+
+### Changed
+
+- `Java.cast` rewritten around a shared `_castProtoCache[className]`.
+  Per-class field accessors and bound methods now live on a prototype
+  object built once at first use; each subsequent `Java.cast(oop,
+  className)` is `Object.create(proto) + 3 own-prop assigns` instead of
+  N `defineProperty` calls.
+- New `_bindMethodOnThis(handle)` — variant of `_bindMethod` that reads
+  the receiver from `this.$oop` at call time (lets a single bound
+  function live on the shared prototype).
+
+### Performance (measured on JDK 17, x64 Release agent)
+
+| Path                      | Before (v0.1.1) | After (v0.1.2) | Change |
+|---------------------------|-----------------|----------------|--------|
+| Per-cast overhead         | ~419 μs         | ~35 μs         | **12x** |
+| L-return auto-cast tput   | 2 341 calls/s   | 23 041 calls/s | **10x** |
+| Primitive baseline (ref)  | 119 048 calls/s | 113 636 calls/s | unchanged |
+
+### Behavioural note
+
+Mutating `instance.$oop = otherOop` on an existing cast proxy now
+redirects subsequent field reads/writes to the new oop (accessors read
+`this.$oop` instead of a captured value). Previously each instance was
+locked to its construction-time oop. Realistic Frida usage doesn't
+mutate `$oop` after cast, so this is a non-breaking semantics change in
+practice.
+
+### Verified
+
+- `tests/bench_autocast.py` — microbenchmark used to drive the change.
+- `tests/verify_frida_parity.py` — all 3 gaps still PASS.
+- `agent_smoke 24/24 PASS · smoke_extended 22/22 PASS` on JDK 8/11/17/21/25.
+
 ## [0.1.1] — 2026-05-04
 
 Frida-parity polish for `Java.use` / `Java.cast` / `.overload`. Real-world
