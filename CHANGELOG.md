@@ -6,6 +6,70 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-05-05
+
+JIT survival now fully covers pure-replacement hooks. The worker
+thread no longer routes new nmethods through the inline-hook engine;
+it writes a 14-byte abs-jmp directly at the new
+`_verified_entry_point`, jumping into our existing FULL_TRAMP-style
+trampoline (which already honors `skip_orig` / `replace_rax`).
+
+### Effect (JDK 17, 5000-iteration tight loop)
+
+|                                  | v0.1.9 | v0.2.0 | **v0.2.1** |
+|----------------------------------|--------|--------|------------|
+| Pure replacement hits            |    271 |  3070  | **5000** ✅ |
+| Pure replacement return applied  |    271 |   271  | **5000** ✅ |
+| Observer hook fires (.attach)    |    271 |  3070  |   ~3000   |
+| callOriginal hits                |    271 |  3070  |    ~375   |
+| callOriginal sum correctness     | clean  | clean  | partial   |
+
+Pure replacement (`return value;` from inside `.implementation`) now
+works **fully** under sustained JIT-tier-up — the v0.1.9 known-limit
+that started this whole worker-thread effort is closed for the
+canonical case.
+
+### Trade-off (callOriginal under JIT regressed slightly)
+
+Calling `callOriginal` from inside an `.implementation` handler
+under JIT-tier-up now produces fewer total fires and incorrect sum
+values vs v0.2.0's inline-hook detour. Reason: the direct-jmp at
+the JIT vep means recursive callOriginal invocations also hit our
+trampoline; with the reentry guard set the trampoline tail-jumps
+to `orig_fie` (the install-time-cached interpreter c2i adapter),
+which post-tier-up may not match the JIT'd nmethod's calling
+convention.
+
+Workaround: don't combine `callOriginal` with hot loops that hit
+JIT thresholds. For non-callOriginal cases (most Frida observers
+and pure replacements), v0.2.1 is a major win.
+
+### Technical
+
+- New helper `seh_write_abs_jmp(at, target)` — writes 14-byte
+  `mov rax, imm64; jmp rax; nop nop` SEH-guarded.
+- `JitWatchEntry` now carries `tramp_addr` (the FULL trampoline)
+  instead of `jit_detour_id`.
+- `jit_watch_loop` patches new vep via direct jmp; no inline-hook
+  install/uninstall churn.
+- `MethodHook::uninstall` unchanged (already removes from watcher
+  before reverting dispatch slots).
+
+### Verified
+
+```
+agent_smoke    24/24 PASS on all 5 JDKs (no regression)
+verify_stress[1-5] PASS on JDK 17
+```
+
+Pure-replacement under JIT specifically:
+```
+hits=5000  sum=49995000   (handler returned 9999 each)
+```
+
+All 5000 calls fired the handler and the replacement reached the
+caller — same correctness as `-Xint` mode.
+
 ## [0.2.0] — 2026-05-05
 
 JIT-survival worker thread. Promises from v0.1.9's known-limit

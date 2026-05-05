@@ -18,8 +18,8 @@ namespace marrow {
 static void register_jit_watch(uint64_t method_addr, size_t code_off,
                                 size_t vep_off_nm, size_t vep_off_cm,
                                 uint64_t ctx_addr,
-                                uint64_t initial_code,
-                                int initial_detour_id);
+                                uint64_t tramp_addr,
+                                uint64_t initial_code);
 static void unregister_jit_watch(uint64_t method_addr);
 extern "C" void marrow_hook_dispatch(HookContext* ctx,
                                        uint64_t* saved_regs,
@@ -291,8 +291,8 @@ struct JitWatchEntry {
     size_t   vep_off_nmethod;   // nmethod::_verified_entry_point (or 0)
     size_t   vep_off_cmethod;   // CompiledMethod::_verified_entry_point (or 0)
     uint64_t ctx_addr;
+    uint64_t tramp_addr;        // FULL_TRAMP_SIZE trampoline (skip_orig-aware)
     uint64_t last_seen_code;
-    int      jit_detour_id;     // current detour id (or <0)
 };
 static std::mutex g_jit_watch_mu;
 static std::vector<JitWatchEntry> g_jit_watch;
@@ -307,6 +307,31 @@ __declspec(noinline)
 static bool seh_write_zero(uint64_t addr) {
     __try {
         *reinterpret_cast<volatile uint64_t*>(addr) = 0;
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Write a 14-byte absolute-jmp at `at` that jumps to `target`. Used to
+// detour a freshly JIT-compiled nmethod's verified_entry_point straight
+// into our FULL_TRAMP-style trampoline (which already honors
+// skip_orig / replace_rax). Requires `at` to be in writable+executable
+// page — the JVM allocates nmethods in RWX code cache, so this works
+// without VirtualProtect dance.
+//   mov rax, imm64    ; 48 b8 .. .. .. .. .. .. .. ..   (10 bytes)
+//   jmp rax           ; ff e0                            ( 2 bytes)
+// Total 12 bytes; we pad to 14 to match HotSpot's nmethod prolog scratch.
+__declspec(noinline)
+static bool seh_write_abs_jmp(uint64_t at, uint64_t target) {
+    uint8_t bytes[14];
+    bytes[0] = 0x48;  // REX.W
+    bytes[1] = 0xB8;  // mov rax, imm64
+    std::memcpy(&bytes[2], &target, 8);
+    bytes[10] = 0xFF;
+    bytes[11] = 0xE0; // jmp rax
+    bytes[12] = 0x90; // nop pad
+    bytes[13] = 0x90;
+    __try {
+        std::memcpy(reinterpret_cast<void*>(at), bytes, sizeof(bytes));
         return true;
     } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
@@ -330,29 +355,25 @@ static void jit_watch_loop() {
                 vep = seh_read_u64(code + entry.vep_off_nmethod);
             if (!vep && entry.vep_off_cmethod)
                 vep = seh_read_u64(code + entry.vep_off_cmethod);
-            int new_detour = -1;
-            if (vep && g_install_jit_detour) {
-                if (entry.jit_detour_id >= 0 && g_uninstall_jit_detour) {
-                    try { g_uninstall_jit_detour(entry.jit_detour_id); } catch (...) {}
-                }
-                try {
-                    new_detour = g_install_jit_detour(
-                        reinterpret_cast<void*>(vep),
-                        entry.ctx_addr,
-                        reinterpret_cast<uint64_t>(&marrow_hook_dispatch),
-                        /*via=*/1);
-                } catch (...) { new_detour = -1; }
+            // Patch the new vep with a direct abs-jmp to our existing
+            // FULL_TRAMP trampoline. The trampoline honors
+            // skip_orig / replace_rax, so .implementation = fn return-
+            // value replacement now works for JIT'd callers too —
+            // unlike v0.2.0's g_install_jit_detour route which couldn't
+            // bypass the original method body.
+            if (vep && entry.tramp_addr) {
+                seh_write_abs_jmp(vep, entry.tramp_addr);
             }
             // Force-back to interpreter path: zeroing _code makes
             // HotSpot dispatch via _from_interpreted_entry on next call.
+            // (Belt-and-braces — even if the JIT vep patch raced, the
+            // interpreter trampoline still catches the call.)
             seh_write_zero(entry.method_addr + entry.code_off);
-            // Persist the new state in the master list.
             {
                 std::lock_guard<std::mutex> lk(g_jit_watch_mu);
                 for (auto& e : g_jit_watch) {
                     if (e.method_addr == entry.method_addr) {
                         e.last_seen_code = code;
-                        e.jit_detour_id  = new_detour;
                         break;
                     }
                 }
@@ -370,12 +391,12 @@ static void start_jit_watch_once() {
 static void register_jit_watch(uint64_t method_addr, size_t code_off,
                                 size_t vep_off_nm, size_t vep_off_cm,
                                 uint64_t ctx_addr,
-                                uint64_t initial_code,
-                                int initial_detour_id) {
+                                uint64_t tramp_addr,
+                                uint64_t initial_code) {
     {
         std::lock_guard<std::mutex> lk(g_jit_watch_mu);
         g_jit_watch.push_back({method_addr, code_off, vep_off_nm, vep_off_cm,
-                                ctx_addr, initial_code, initial_detour_id});
+                                ctx_addr, tramp_addr, initial_code});
     }
     start_jit_watch_once();
 }
@@ -703,8 +724,8 @@ MethodHook install_callback_hook_full(VMMeta* vm, const MethodSnapshot& method,
             vep_off_cm = f->offset;
     }
     register_jit_watch(method.address, code_off, vep_off_nm, vep_off_cm,
-                       ctx_addr, /*initial_code=*/orig_code,
-                       /*initial_detour_id=*/jit_id);
+                       ctx_addr, /*tramp_addr=*/tramp,
+                       /*initial_code=*/orig_code);
     return hk;
 }
 
