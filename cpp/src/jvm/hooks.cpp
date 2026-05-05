@@ -18,6 +18,7 @@ namespace marrow {
 static void register_jit_watch(uint64_t method_addr, size_t code_off,
                                 size_t fie_off, size_t fce_off,
                                 size_t vep_off_nm, size_t vep_off_cm,
+                                size_t state_off_nm,
                                 uint64_t ctx_addr,
                                 uint64_t tramp_addr,
                                 uint64_t initial_code);
@@ -293,6 +294,7 @@ struct JitWatchEntry {
     size_t   fce_off;            // Method::_from_compiled_entry byte offset
     size_t   vep_off_nmethod;   // nmethod::_verified_entry_point (or 0)
     size_t   vep_off_cmethod;   // CompiledMethod::_verified_entry_point (or 0)
+    size_t   state_off_nmethod; // nmethod::_state byte offset (or 0)
     uint64_t ctx_addr;
     uint64_t tramp_addr;        // FULL_TRAMP_SIZE trampoline (skip_orig-aware)
     uint64_t last_seen_code;
@@ -317,6 +319,13 @@ __declspec(noinline)
 static bool seh_write_u64(uint64_t addr, uint64_t val) {
     __try {
         *reinterpret_cast<volatile uint64_t*>(addr) = val;
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+__declspec(noinline)
+static bool seh_write_u32(uint64_t addr, uint32_t val) {
+    __try {
+        *reinterpret_cast<volatile uint32_t*>(addr) = val;
         return true;
     } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
@@ -349,7 +358,11 @@ static bool seh_write_abs_jmp(uint64_t at, uint64_t target) {
 static void jit_watch_loop() {
     using namespace std::chrono_literals;
     while (true) {
-        std::this_thread::sleep_for(5ms);
+        // 1ms poll — fast enough to catch HotSpot's multi-tier
+        // recompilations (C1 → C2 transition typically takes a few ms).
+        // Cost is trivial: ~N pointer reads per tick where N is the
+        // hook count. Empty watchlist → continue immediately, no poll.
+        std::this_thread::sleep_for(1ms);
         std::vector<JitWatchEntry> snapshot;
         {
             std::lock_guard<std::mutex> lk(g_jit_watch_mu);
@@ -384,6 +397,16 @@ static void jit_watch_loop() {
             if (vep && entry.tramp_addr) {
                 seh_write_abs_jmp(vep, entry.tramp_addr);
             }
+            // Mark the new nmethod as `not_entrant` (state=1) to force
+            // any inline-cached call site that resolved to its vep
+            // BEFORE our patch to re-resolve through Method::_from_
+            // compiled_entry on next call. Since fce is patched to our
+            // trampoline, that re-resolve lands in the hook. This is
+            // what closes the IC-already-cached-old-vep gap that
+            // limited callOriginal hit-rate to ~7% in v0.2.2.
+            if (entry.state_off_nmethod) {
+                seh_write_u32(code + entry.state_off_nmethod, /*not_entrant*/1);
+            }
             seh_write_zero(entry.method_addr + entry.code_off);
             {
                 std::lock_guard<std::mutex> lk(g_jit_watch_mu);
@@ -407,13 +430,14 @@ static void start_jit_watch_once() {
 static void register_jit_watch(uint64_t method_addr, size_t code_off,
                                 size_t fie_off, size_t fce_off,
                                 size_t vep_off_nm, size_t vep_off_cm,
+                                size_t state_off_nm,
                                 uint64_t ctx_addr,
                                 uint64_t tramp_addr,
                                 uint64_t initial_code) {
     {
         std::lock_guard<std::mutex> lk(g_jit_watch_mu);
         g_jit_watch.push_back({method_addr, code_off, fie_off, fce_off,
-                                vep_off_nm, vep_off_cm,
+                                vep_off_nm, vep_off_cm, state_off_nm,
                                 ctx_addr, tramp_addr, initial_code});
     }
     start_jit_watch_once();
@@ -730,19 +754,21 @@ MethodHook install_callback_hook_full(VMMeta* vm, const MethodSnapshot& method,
     hk.jit_detour_vep_src = vep_src;
 
     // Spin up the JIT-survival watcher for this hook. Resolve the
-    // verified_entry_point offsets once (we already discovered which
-    // class — nmethod or CompiledMethod — exposes them above).
-    size_t vep_off_nm = 0, vep_off_cm = 0;
+    // verified_entry_point + _state offsets once (already-discovered
+    // type carries them).
+    size_t vep_off_nm = 0, vep_off_cm = 0, state_off_nm = 0;
     if (auto* nmt = vm->type("nmethod")) {
         if (auto* f = nmt->field("_verified_entry_point"))
             vep_off_nm = f->offset;
+        if (auto* f = nmt->field("_state"))
+            state_off_nm = f->offset;
     }
     if (auto* cmt = vm->type("CompiledMethod")) {
         if (auto* f = cmt->field("_verified_entry_point"))
             vep_off_cm = f->offset;
     }
     register_jit_watch(method.address, code_off, fie_off, fce_off,
-                       vep_off_nm, vep_off_cm,
+                       vep_off_nm, vep_off_cm, state_off_nm,
                        ctx_addr, /*tramp_addr=*/tramp,
                        /*initial_code=*/orig_code);
     return hk;

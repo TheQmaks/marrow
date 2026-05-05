@@ -6,6 +6,76 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-05-05
+
+Honest v0.3 — two infrastructure improvements that close as much of the
+remaining callOriginal-under-JIT gap as can be done **without** the
+JVMTI compilation events Marrow deliberately avoids.
+
+### Changed
+
+- **JIT-survival worker poll: 5ms → 1ms.** HotSpot's tiered compiler
+  generates C1 → C2 transitions in a few ms each; faster polling
+  reduces the window where new nmethods exist before we patch them.
+  Cost is negligible (a few pointer reads per tick × N hooks).
+- **New nmethods marked `not_entrant` on detection.** Worker writes
+  `nmethod::_state = 1` (offset resolved via vmStructs) when a fresh
+  nmethod appears. The intent: cause HotSpot's IC handler to re-resolve
+  cached call sites through `Method::_from_compiled_entry` — which is
+  patched to our trampoline — on next call. In practice IC
+  invalidation requires a VM_Operation safepoint that we can't trigger
+  from outside, so the marker is opportunistic; landed without
+  measurable hit-rate improvement on JDK 17, no regression.
+
+### Added
+
+- `JitWatchEntry::state_off_nmethod` + `seh_write_u32` helper for the
+  state-byte poke.
+
+### Effect (JDK 17, 5000-iteration tight loop)
+
+|                                  | v0.2.2 | **v0.3.0** | Δ |
+|----------------------------------|--------|------------|---|
+| Pure replacement hits + applied  |  5000  |   5000     | unchanged ✅ |
+| callOriginal hits                |   365  |    365     | unchanged |
+| callOriginal sum correctness     | clean  |   clean    | unchanged ✅ |
+| Observer fires (drain at end)    |    16  |     16     | ring-cap |
+
+Pure-replacement under JIT remains fully solved. callOriginal hot-loop
+hit-rate did not improve from these tweaks — the architectural ceiling
+of polling-based catch-up is approximately what we observe.
+
+### What this v0.3 is NOT
+
+- Not a JVMTI integration. We deliberately don't use JVMTI; that's a
+  core Marrow architectural decision.
+- Not a HotSpot compilation-event hook. That would require deep
+  jvm.dll internal patching beyond what's stable across JDK versions.
+- Not a 100% callOriginal-under-hot-loop fix. The remaining gap is
+  fundamentally a race between HotSpot's compile-thread publishing
+  a new nmethod (and its callers caching the new vep) versus our
+  worker observing and patching. Polling can't win that race.
+
+### What v0.3 IS
+
+The state we converge to without JVMTI: pure replacement is bullet-
+proof, observer hooks recover ~60% under tier-up, callOriginal is
+honest (clean numbers, no garbage, no crashes) at ~7% hit rate
+under sustained hot-loop tier-up. Real-world Frida scripts (which
+don't combine `callOriginal` with >270-iteration tight loops) hit
+this gap effectively never.
+
+### Verified
+
+```
+agent_smoke    24/24 PASS on all 5 JDKs (no regression)
+verify_stress  34/34 PASS on JDK 17
+verify_stress2 13/13 PASS on JDK 17
+verify_stress3 11/11 PASS on JDK 17
+verify_stress4  5/5  PASS on JDK 17
+verify_stress5  6/6  PASS on JDK 17
+```
+
 ## [0.2.2] — 2026-05-05
 
 Strictly-better fix for the v0.2.1 callOriginal regression. Worker
