@@ -53,13 +53,28 @@ static void usage(const char* argv0) {
         argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
-static int run_dump(const std::string& dll_path) {
+static int run_dump(const std::string& dll_path, const std::string& filter = "") {
     LocalReader lr(dll_path);
     VMMeta vm(&lr);
     std::printf("## source: %s\n", dll_path.c_str());
     std::printf("## counts: types=%zu structs=%zu int_consts=%zu long_consts=%zu\n",
                 vm.num_types(), vm.num_structs(),
                 vm.num_int_consts(), vm.num_long_consts());
+    if (!filter.empty()) {
+        if (auto* t = vm.type(filter)) {
+            std::printf("## type %s size=%llu fields=%zu\n",
+                        t->name.c_str(), (unsigned long long)t->size,
+                        t->fields.size());
+            for (auto& kv : t->fields) {
+                std::printf("  +%-5llu %s : %s\n",
+                            (unsigned long long)kv.second.offset,
+                            kv.second.name.c_str(),
+                            kv.second.type_string.c_str());
+            }
+        } else {
+            std::printf("## type %s NOT FOUND\n", filter.c_str());
+        }
+    }
     return 0;
 }
 
@@ -674,7 +689,7 @@ int main(int argc, char** argv) {
     if (argc < 3) { usage(argv[0]); return 1; }
     try {
         std::string cmd = argv[1];
-        if      (cmd == "dump")    return run_dump(argv[2]);
+        if      (cmd == "dump")    return run_dump(argv[2], argc > 3 ? argv[3] : "");
         else if (cmd == "threads") return run_threads(DWORD(std::atoi(argv[2])));
         else if (cmd == "classes") return run_classes(DWORD(std::atoi(argv[2])));
         else if (cmd == "read-string" && argc >= 5)

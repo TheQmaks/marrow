@@ -6,6 +6,110 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-05
+
+The hot-loop callOriginal ceiling fell. v0.3 honestly admitted ~7%
+hit-rate on sustained JIT'd loops as the polling-without-JVMTI ceiling;
+v0.4 routes around the polling premise entirely by **disabling JIT
+compilation** for hooked methods at install time. HotSpot never
+schedules a compile, never publishes an nmethod, the
+publish/patch race that v0.2/v0.3 chased disappears.
+
+### Added
+
+- **`Method::_access_flags |= NOT_C1_COMPILABLE | NOT_C2_COMPILABLE
+  | NOT_C2_OSR_COMPILABLE`** at install_callback_hook_full. Sets bits
+  0x02000000, 0x04000000, 0x08000000 on JDK 8/11/17 (where the
+  not-compilable flags overlay high bits of `_access_flags`). On
+  JDK 21+ tries `_compiler_flags` field first (bits 0x01/0x02/0x04)
+  but falls through silently when vmStructs doesn't expose it
+  (current state of mainline JDK 21+). Effect: HotSpot's
+  `CompilationPolicy::can_be_compiled()` returns false → method
+  stays interpreter-only forever → tramp survives unconditionally.
+
+- **Counter pinning belt-and-suspenders.** Even when access-flags
+  disable works, dispatch + worker now write `_invocation_counter
+  = 0x80000000` each fire/poll so `count() = -268M` and threshold
+  checks fail by a 268-million-call margin. Survives slow MC
+  allocation on hooks installed before first call. Backedge counter
+  also pinned in worker for OSR-compile suppression.
+
+- **Unconditional dispatch-slot re-pin in worker_loop.** Old code
+  only re-patched `_fie/_fce` on `_code` change detection. HotSpot
+  has paths (link_method, adapter relink, class redefinition) that
+  rewrite `_fie` without touching `_code` — those silently bypassed
+  the trampoline. Now worker reads `_fie/_fce` every tick and
+  rewrites if not equal to tramp.
+
+- **Diagnostic counters in `marrow_hook_dispatch`:** `g_dbg_fire_total`
+  (every dispatch entry) and `g_dbg_skip_reentry` (reentry-guard
+  short-circuits). JS-side `Marrow._dbgFireTotal()`,
+  `_dbgSkipReentry()`, `_dbgReset()`. Used internally to verify that
+  dispatch is firing on every call and not silently bypassed.
+
+- **`marrow.exe dump <jvm.dll> [type]`** now accepts an optional
+  type-name and dumps that type's fields with offsets and types.
+  Used to verify which `_compiler_flags`-equivalent field is
+  actually exposed via vmStructs on a given JDK.
+
+- **`HookContext::method_mc_addr` and `counter_pin_in_mc`** at
+  +336 / +344 — used by dispatch to pin counter on each fire.
+  `JitWatchEntry` extended with `mc_off`, `ic_off`, `be_off`,
+  `cnt_off` for worker-side pinning.
+
+- New diagnostic test `tests/diag_callorig.py` — instruments tramp
+  fires vs handler hits to detect bypass paths.
+
+### Changed
+
+- **HookContext layout** grew by 16 bytes (two new u64 fields). All
+  trampoline ASM offset constants checked; new fields live past the
+  ASM-touched region (skip_orig +40, replace_rax +48). No ASM updates
+  needed.
+- **Hook ring buffer 16 → 1024** (`HOOK_RING_SIZE` and `_RING_CAP`).
+  Old size dropped >99% of `.attach` observer fires under hot loops
+  between drain calls; new size absorbs ~1ms of MHz-rate fires or
+  1 second of kHz observers without overwrite. Memory cost: ~270KB
+  per JsImplEntry.
+- **`verify_stress5.py:sustained_500_callOriginal` expectation
+  comment** updated. JDK 8/11/17 now strict 'ok'; JDK 21+ remains
+  partial-and-numerically-correct (vmStructs gap).
+
+### Effect (5000-iteration tight loop)
+
+|                              | v0.3.0      | **v0.4.0** | JDK |
+|------------------------------|-------------|------------|-----|
+| Pure replacement hits        |  5000/5000  |  5000/5000 | all |
+| callOriginal hits            |   365/5000  |  5000/5000 | 8, 11, 17 |
+| callOriginal hits            |   365/5000  |  ~3500/5000 | 25 |
+| callOriginal hits            |   365/5000  |  ~900/5000 | 21 |
+| callOriginal sum correctness |   clean     |   clean    | all |
+
+JDK 8/11/17 went from 7.3% hit rate to **100%**. JDK 21/25 partial —
+the not-compilable field they need isn't exposed via vmStructs in
+current mainline builds, so v0.4 only gets counter-pinning coverage
+there. When JDK 21+ vmStructs picks up `_compiler_flags`, that
+fallback branch will activate automatically.
+
+### Cross-JDK regression
+
+- agent_smoke 24/24 PASS × JDK 8 / 11 / 17 / 21 / 25 ✅
+- verify_stress + verify_stress2/3/4/5: ALL CHECKS PASS × JDK 17 ✅
+- verify_stress5: ALL CHECKS PASS × JDK 8 / 11 / 17 / 21 / 25 ✅
+
+### What this v0.4 is NOT
+
+- Not a JVMTI integration — still no compilation events. The fix
+  works because we're allowed to mutate Method flags from outside
+  HotSpot, not because we're informed by HotSpot of compile decisions.
+- Not a way to disable JIT globally. Only the explicitly-hooked
+  method gets the not-compilable bits set; unhooked methods JIT as
+  normal.
+- Not a perfect fix on JDK 21+. Hit rate jumped ~5x there too but
+  full closure waits for either vmStructs to expose `_compiler_flags`
+  or for an empirical offset-finding heuristic (deferred — risk of
+  per-JDK fragility).
+
 ## [0.3.0] — 2026-05-05
 
 Honest v0.3 — two infrastructure improvements that close as much of the

@@ -1388,6 +1388,34 @@ duk_ret_t js_setReentryGuard(duk_context* ctx) {
     return 1;
 }
 
+// Diagnostics for hot-loop tramp behavior. Three counters (read via
+// strings since Duktape int is double): total dispatch fires, fires
+// short-circuited by reentry guard, fires that ran cb.
+//   marrow_hook_dbg_fire_total / dbg_skip_reentry / dbg_reset
+// (No JS-side wrappers needed beyond the c-funcs; called as ints.)
+extern "C" uint64_t marrow_hook_dbg_fire_total();
+extern "C" uint64_t marrow_hook_dbg_skip_reentry();
+extern "C" void     marrow_hook_dbg_reset();
+duk_ret_t js_dbgFireTotal(duk_context* ctx) {
+    uint64_t v = marrow_hook_dbg_fire_total();
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%llu", (unsigned long long)v);
+    duk_push_string(ctx, buf);
+    return 1;
+}
+duk_ret_t js_dbgSkipReentry(duk_context* ctx) {
+    uint64_t v = marrow_hook_dbg_skip_reentry();
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%llu", (unsigned long long)v);
+    duk_push_string(ctx, buf);
+    return 1;
+}
+duk_ret_t js_dbgReset(duk_context* ctx) {
+    marrow_hook_dbg_reset();
+    duk_push_true(ctx);
+    return 1;
+}
+
 // Diagnostic: try wrapping an oop via JNIEnv->NewLocalRef. Returns the
 // jobject hex or an error string. Used to isolate JNI crashes from the
 // rest of the invokeJNI path.
@@ -1805,6 +1833,12 @@ void register_javacall_bindings(void* duk_ctx, int ns_idx) {
     duk_put_prop_string(ctx, ns_idx, "_diagJniNewLocal");
     duk_push_c_function(ctx, js_setReentryGuard, 2);
     duk_put_prop_string(ctx, ns_idx, "_setReentryGuard");
+    duk_push_c_function(ctx, js_dbgFireTotal, 0);
+    duk_put_prop_string(ctx, ns_idx, "_dbgFireTotal");
+    duk_push_c_function(ctx, js_dbgSkipReentry, 0);
+    duk_put_prop_string(ctx, ns_idx, "_dbgSkipReentry");
+    duk_push_c_function(ctx, js_dbgReset, 0);
+    duk_put_prop_string(ctx, ns_idx, "_dbgReset");
     duk_push_c_function(ctx, js_defineClassNative, 3);
     duk_put_prop_string(ctx, ns_idx, "_defineClassNative");
     duk_push_c_function(ctx, js_invokeViaCallStub, DUK_VARARGS);

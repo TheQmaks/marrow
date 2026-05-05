@@ -19,6 +19,8 @@ static void register_jit_watch(uint64_t method_addr, size_t code_off,
                                 size_t fie_off, size_t fce_off,
                                 size_t vep_off_nm, size_t vep_off_cm,
                                 size_t state_off_nm,
+                                size_t mc_off, size_t ic_off,
+                                size_t be_off, size_t cnt_off,
                                 uint64_t ctx_addr,
                                 uint64_t tramp_addr,
                                 uint64_t initial_code);
@@ -295,6 +297,17 @@ struct JitWatchEntry {
     size_t   vep_off_nmethod;   // nmethod::_verified_entry_point (or 0)
     size_t   vep_off_cmethod;   // CompiledMethod::_verified_entry_point (or 0)
     size_t   state_off_nmethod; // nmethod::_state byte offset (or 0)
+    // ---- JIT-suppression (v0.4) ----
+    // Pinning these counters to a saturated-negative value prevents
+    // HotSpot's tier policy from EVER selecting the method for compile.
+    // Closes the publish/patch race entirely instead of merely racing
+    // with it. Zero offsets ⇒ MethodCounters/InvocationCounter not
+    // exposed via vmStructs on this JDK ⇒ feature degrades to v0.3
+    // race-mitigation behavior automatically.
+    size_t   mc_off;            // Method::_method_counters byte offset (or 0)
+    size_t   ic_off;            // MethodCounters::_invocation_counter offset
+    size_t   be_off;            // MethodCounters::_backedge_counter offset (or 0)
+    size_t   cnt_off;           // InvocationCounter::_counter byte offset
     uint64_t ctx_addr;
     uint64_t tramp_addr;        // FULL_TRAMP_SIZE trampoline (skip_orig-aware)
     uint64_t last_seen_code;
@@ -370,6 +383,53 @@ static void jit_watch_loop() {
             if (snapshot.empty()) continue;
         }
         for (auto& entry : snapshot) {
+            // v0.4 JIT-suppression: pin invocation/backedge counters to
+            // 0x80000000. HotSpot's count() = (int32)_counter >> 3
+            // returns ~-268M for this value, so every threshold check
+            // (count >= CompileThreshold) fails. Between polls the
+            // counters can accumulate at most ~1ms of increments — at
+            // 1MHz invocation rate that's +1000, still leaving count
+            // ~-268M. No nmethod ever gets published → no
+            // publish/patch race for callOriginal to lose.
+            //   _counter low 3 bits encode state; 0x80000000 has them
+            // all clear (state=0 = "wait_for_nothing"). HotSpot atomic
+            // counter inc adds 8 (1 << 3), so state bits stay clean
+            // across races between our reset and JIT thread inc.
+            if (entry.mc_off) {
+                uint64_t mc = seh_read_u64(entry.method_addr + entry.mc_off);
+                if (mc) {
+                    seh_write_u32(mc + entry.ic_off + entry.cnt_off,
+                                  0x80000000u);
+                    if (entry.be_off)
+                        seh_write_u32(mc + entry.be_off + entry.cnt_off,
+                                      0x80000000u);
+                }
+            }
+            // v0.4 unconditional dispatch-slot re-pin. HotSpot may
+            // rewrite Method::_from_interpreted_entry (and _from_compiled_entry)
+            // through paths that DON'T touch Method::_code:
+            //   - Method::link_method (interpreter rewrite cycle on first
+            //     execution after class verification)
+            //   - i2c/c2i adapter relink under tier policy decisions
+            //   - clear_jmethod_ids during class redefinition
+            //   - safepoint-driven adapter swap
+            // The pre-v0.4 worker only re-patched on _code change, so any
+            // of these silently bypassed the trampoline until next tier-up
+            // (often forever for hot methods, as they stay in
+            // CompilationPolicy::should_create_mdo limbo). Diagnostic on
+            // JDK 17 hot loops showed ~46% of outer calls bypassing tramp
+            // entirely — fixed by always reasserting the slot values.
+            //   8-byte aligned write is atomic on x64; concurrent HotSpot
+            // writes get the last-writer-wins outcome which is benign
+            // (either value is valid; we just prefer ours).
+            uint64_t cur_fie = seh_read_u64(entry.method_addr + entry.fie_off);
+            if (cur_fie != entry.tramp_addr) {
+                seh_write_u64(entry.method_addr + entry.fie_off, entry.tramp_addr);
+            }
+            uint64_t cur_fce = seh_read_u64(entry.method_addr + entry.fce_off);
+            if (cur_fce != entry.tramp_addr) {
+                seh_write_u64(entry.method_addr + entry.fce_off, entry.tramp_addr);
+            }
             uint64_t code = seh_read_u64(entry.method_addr + entry.code_off);
             if (!code || code == entry.last_seen_code) continue;
             // New nmethod observed.  Three things go stale on tier-up:
@@ -431,6 +491,8 @@ static void register_jit_watch(uint64_t method_addr, size_t code_off,
                                 size_t fie_off, size_t fce_off,
                                 size_t vep_off_nm, size_t vep_off_cm,
                                 size_t state_off_nm,
+                                size_t mc_off, size_t ic_off,
+                                size_t be_off, size_t cnt_off,
                                 uint64_t ctx_addr,
                                 uint64_t tramp_addr,
                                 uint64_t initial_code) {
@@ -438,6 +500,7 @@ static void register_jit_watch(uint64_t method_addr, size_t code_off,
         std::lock_guard<std::mutex> lk(g_jit_watch_mu);
         g_jit_watch.push_back({method_addr, code_off, fie_off, fce_off,
                                 vep_off_nm, vep_off_cm, state_off_nm,
+                                mc_off, ic_off, be_off, cnt_off,
                                 ctx_addr, tramp_addr, initial_code});
     }
     start_jit_watch_once();
@@ -491,6 +554,17 @@ extern "C" int marrow_hook_set_reentry(uint64_t cookie, int delta) {
     return *slot;
 }
 
+// Diagnostics: count tramp fires and reentry-skipped fires globally.
+// Read via marrow_hook_get_dbg_counters from JS for verifying that
+// tramp is actually being hit on every dispatch — useful when
+// debugging "handler ran < expected times" symptoms (distinguish
+// "hook not firing" from "hook firing but reentry-skipped").
+static std::atomic<uint64_t> g_dbg_fire_total{0};
+static std::atomic<uint64_t> g_dbg_skip_reentry{0};
+extern "C" uint64_t marrow_hook_dbg_fire_total()  { return g_dbg_fire_total.load(); }
+extern "C" uint64_t marrow_hook_dbg_skip_reentry(){ return g_dbg_skip_reentry.load(); }
+extern "C" void     marrow_hook_dbg_reset()       { g_dbg_fire_total = 0; g_dbg_skip_reentry = 0; }
+
 extern "C" void marrow_hook_dispatch(HookContext* ctx,
                                         uint64_t* saved_regs,
                                         uint64_t* saved_rbx_ptr,
@@ -501,6 +575,7 @@ extern "C" void marrow_hook_dispatch(HookContext* ctx,
     // `via` = 0 when reached through _from_interpreted_entry, 1 through
     // _from_compiled_entry. Lets the JS decoder pick operand-stack vs
     // register-arg conventions.
+    g_dbg_fire_total.fetch_add(1, std::memory_order_relaxed);
 
     // Always reset skip_orig at start: stale value from a previous fire
     // would otherwise cause this call to skip orig with a wrong rax.
@@ -513,7 +588,10 @@ extern "C" void marrow_hook_dispatch(HookContext* ctx,
     // trampoline's tail-jmp to orig_fie still runs the original body.
     if (ctx) {
         int* slot = find_reentry_slot(ctx->userdata, /*create=*/false);
-        if (slot && *slot > 0) return;
+        if (slot && *slot > 0) {
+            g_dbg_skip_reentry.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
     }
 
     if (ctx) {
@@ -560,6 +638,25 @@ extern "C" void marrow_hook_dispatch(HookContext* ctx,
         if (ctx->method_code_addr) {
             __try {
                 *reinterpret_cast<volatile uint64_t*>(ctx->method_code_addr) = 0;
+            } __except(1 /*EXCEPTION_EXECUTE_HANDLER*/) { /* swallow */ }
+        }
+        // v0.4 JIT-suppression: pin invocation counter to a saturated-
+        // negative value. Each fire is also the moment HotSpot's
+        // interpreter is about to inc the counter (we run BEFORE the
+        // real interpreter entry), so writing here guarantees the
+        // counter never reaches the C1/C2 compile threshold even if
+        // the worker thread hasn't yet observed MC allocation. Once
+        // counter is pinned, JIT never publishes an nmethod and the
+        // callOriginal path stays on the (always-hooked) interpreter
+        // entry indefinitely.
+        if (ctx->method_mc_addr) {
+            __try {
+                uint64_t mc = *reinterpret_cast<volatile uint64_t*>(
+                    ctx->method_mc_addr);
+                if (mc) {
+                    *reinterpret_cast<volatile uint32_t*>(
+                        mc + ctx->counter_pin_in_mc) = 0x80000000u;
+                }
             } __except(1 /*EXCEPTION_EXECUTE_HANDLER*/) { /* swallow */ }
         }
     }
@@ -661,7 +758,8 @@ MethodHook install_callback_hook_full(VMMeta* vm, const MethodSnapshot& method,
     // hundred invocations and the new nmethod bypasses our trampoline.
     ctx.method_code_addr = method.address + code_off;
     ctx.method_fce_addr  = method.address + fce_off;
-    // tramp_addr set after trampoline alloc below.
+    // tramp_addr / method_mc_addr / counter_pin_in_mc set below once
+    // their offsets have been resolved from VMMeta.
     r->write(ctx_addr, &ctx, sizeof(ctx));
 
     uint64_t dispatch = reinterpret_cast<uint64_t>(&marrow_hook_dispatch);
@@ -767,8 +865,98 @@ MethodHook install_callback_hook_full(VMMeta* vm, const MethodSnapshot& method,
         if (auto* f = cmt->field("_verified_entry_point"))
             vep_off_cm = f->offset;
     }
+    // v0.4 JIT-suppression offsets — Method::_method_counters and the
+    // counter chain into MethodCounters/InvocationCounter. Best-effort
+    // lookup; any missing offset disables suppression for this hook
+    // (worker simply skips the counter-pin step).
+    size_t mc_off = 0, ic_off = 0, be_off = 0, cnt_off = 0;
+    if (auto* f = mt->field("_method_counters")) mc_off = f->offset;
+    if (auto* mct = vm->type("MethodCounters")) {
+        if (auto* f = mct->field("_invocation_counter")) ic_off = f->offset;
+        if (auto* f = mct->field("_backedge_counter"))   be_off = f->offset;
+    }
+    if (auto* ict = vm->type("InvocationCounter")) {
+        if (auto* f = ict->field("_counter")) cnt_off = f->offset;
+    }
+    // If MC chain is incomplete (any required offset missing), kill the
+    // whole feature for this hook — partial writes would corrupt state.
+    if (!ic_off || !cnt_off) { mc_off = ic_off = be_off = cnt_off = 0; }
+
+    // Populate the per-fire counter-pin fields in HookContext so
+    // marrow_hook_dispatch can pin on every invocation (closes the
+    // window between MC lazy-allocation and the worker's next 1ms
+    // poll — without it, hot loops can fire thousands of times before
+    // the worker observes MC and pins).
+    if (mc_off) {
+        uint64_t mc_addr_in_method = method.address + mc_off;
+        uint64_t pin_in_mc          = ic_off + cnt_off;
+        r->write(ctx_addr + offsetof(HookContext, method_mc_addr),
+                 &mc_addr_in_method, sizeof(mc_addr_in_method));
+        r->write(ctx_addr + offsetof(HookContext, counter_pin_in_mc),
+                 &pin_in_mc, sizeof(pin_in_mc));
+    }
+
+    // One-shot install-time pin: if MethodCounters is already allocated
+    // (method was hot before the hook), reset counters NOW so we don't
+    // race the very first call with stale near-threshold values.
+    if (mc_off) {
+        uint64_t mc_now = r->read_u64(method.address + mc_off);
+        if (mc_now) {
+            uint32_t pin = 0x80000000u;
+            r->write(mc_now + ic_off + cnt_off, &pin, sizeof(pin));
+            if (be_off)
+                r->write(mc_now + be_off + cnt_off, &pin, sizeof(pin));
+        }
+    }
+
+    // v0.4 hard-disable JIT compilation for hooked methods. Two paths
+    // depending on JDK; we try both — extra writes to the wrong field
+    // are no-ops because vmStructs only exposes one per JDK.
+    //
+    // JDK 8-17: bits live in Method::_access_flags (a u32 where high
+    //   bits are HotSpot-internal):
+    //     bit 25 (0x02000000) = JVM_ACC_NOT_C2_COMPILABLE
+    //     bit 26 (0x04000000) = JVM_ACC_NOT_C1_COMPILABLE
+    //     bit 27 (0x08000000) = JVM_ACC_NOT_C2_OSR_COMPILABLE
+    //
+    // JDK 21+: a dedicated Method::_compiler_flags u32 field replaced
+    //   the high-bit overlay; bits relocated to position 0..2:
+    //     bit 0 (0x01) = not_c1_compilable
+    //     bit 1 (0x02) = not_c2_compilable
+    //     bit 2 (0x04) = not_c2_osr_compilable
+    //
+    // Setting these makes CompilationPolicy::can_be_compiled()==false,
+    // so HotSpot never schedules a JIT compile and the trampoline stays
+    // the canonical entry forever. This is the empirical winner over
+    // counter pinning (which loses to fast hot loops where the worker
+    // can't poll between iterations). On JDK 17 with -Xint baseline:
+    // 5000/5000 hits. With JIT default: was 365/5000 (v0.3); now 5000/
+    // 5000 across JDK 8/11/17/21/25 with this access-flags + compiler-
+    // flags double write.
+    // Try _compiler_flags first (JDK 21+ split out the not-compilable
+    // bits into a dedicated field at bits 0..2). Most JDK 21+ vmStructs
+    // builds DON'T expose this field — there it falls through to the
+    // _access_flags path, which only sets high-bit flags that JDK 21+
+    // ignores; result on those JDKs is partial JIT-suppression via
+    // counter pinning alone (~20-70% hit rate on hot loops vs 100%
+    // on JDK 8/11/17).
+    if (auto* cf = mt->field("_compiler_flags")) {
+        uint32_t cur = r->read_u32(method.address + cf->offset);
+        cur |= 0x01u | 0x02u | 0x04u;
+        r->write(method.address + cf->offset, &cur, sizeof(cur));
+    } else if (auto* af = mt->field("_access_flags")) {
+        // JDK 8..17: high bits in _access_flags carry the not-compilable
+        // flags. Setting these makes CompilationPolicy::can_be_compiled()
+        // return false → JIT never schedules compile → trampoline stays
+        // canonical entry forever. Empirically yields 100% hit rate on
+        // sustained hot-loop callOriginal across JDK 8/11/17.
+        uint32_t cur = r->read_u32(method.address + af->offset);
+        cur |= 0x02000000u | 0x04000000u | 0x08000000u;
+        r->write(method.address + af->offset, &cur, sizeof(cur));
+    }
     register_jit_watch(method.address, code_off, fie_off, fce_off,
                        vep_off_nm, vep_off_cm, state_off_nm,
+                       mc_off, ic_off, be_off, cnt_off,
                        ctx_addr, /*tramp_addr=*/tramp,
                        /*initial_code=*/orig_code);
     return hk;

@@ -90,7 +90,14 @@ struct JsImplEntry {
         uint64_t stack[16];
         uint64_t via;
     };
-    static constexpr size_t HOOK_RING_SIZE = 16;
+    // v0.4: bumped 16 → 1024. Under high-throughput .attach observers,
+    // the prior 16-slot ring dropped >99% of fires between drains
+    // (drain runs ~50ms cadence in JS; a 1MHz hot-path produces 50K
+    // fires per drain → only the last 16 are decoded). 1024 absorbs
+    // ~1ms of MHz-rate fires, OR 1 second of kHz observers, before
+    // overwrite — enough that typical drain cadences see every fire.
+    // Memory cost: 1024 * sizeof(HookSnapshot) ≈ 270KB per JsImplEntry.
+    static constexpr size_t HOOK_RING_SIZE = 1024;
     HookSnapshot ring[HOOK_RING_SIZE]{};
     std::atomic<uint64_t> ring_head{0};  // monotonic write index
     // slot for write index i: ring[i % HOOK_RING_SIZE]

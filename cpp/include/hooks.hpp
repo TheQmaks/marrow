@@ -78,6 +78,16 @@ struct HookContext {
     uint64_t method_code_addr;     // address of Method::_code           (+312)
     uint64_t method_fce_addr;      // address of Method::_from_compiled_entry (+320)
     uint64_t tramp_addr;           // our trampoline (re-applied to fce) (+328)
+    // ---- v0.4 JIT-suppression --------------------------------------- (+336)
+    // Address of the Method::_method_counters slot. Dispatch reads this
+    // each fire; if non-null and the slot points to a live MC, writes
+    // 0x80000000 into MC + counter_pin_in_mc to pin the invocation
+    // counter to a saturated-negative value. HotSpot's count() returns
+    // ~-268M, so threshold checks (count >= CompileThreshold) never
+    // succeed and JIT compilation never starts — no nmethod, no
+    // publish/patch race for callOriginal to lose.
+    uint64_t method_mc_addr;       // address of Method::_method_counters (+336)
+    uint64_t counter_pin_in_mc;    // _invocation_counter._counter offset (+344)
 };
 // Trampoline ASM hardcodes the offsets below — keep struct field layout
 // in sync with these constants:

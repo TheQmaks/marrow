@@ -2501,12 +2501,13 @@ R"JS(
     },
 
     // Drain accumulated invocations. Per cookie, iterates AT MOST the ring
-    // capacity (16 slots) — older fires were overwritten. Without this cap
-    // hot-tick targets at MHz rates produced delta values in the millions,
-    // each redecoded against the same 16 ring slots — pegging the agent
-    // and timing out IPC. Returns the number of events DECODED (not the
+    // capacity — older fires were overwritten. Without this cap hot-tick
+    // targets at MHz rates produced delta values in the millions, each
+    // redecoded against the same N ring slots — pegging the agent and
+    // timing out IPC. Returns the number of events DECODED (not the
     // raw fire count which is in events[i].delta).
-    _RING_CAP: 16,
+    //   v0.4: bumped 16 → 1024 to match HOOK_RING_SIZE on the C side.
+    _RING_CAP: 1024,
     drain: function() {
         var events = Marrow._drainImplEvents();
         var decoded_total = 0;
