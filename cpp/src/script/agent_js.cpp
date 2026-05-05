@@ -117,6 +117,7 @@ static JsImplRegistry g_js_impl;
 // Method* is re-hooked (e.g. via a fresh Java.use() handle without a cookie).
 struct LiveImplHook {
     MethodHook hook;
+    uint64_t   cookie = 0;   // for matching the JsImplEntry to remove on uninstall
 };
 static std::mutex g_live_impl_mu;
 static std::unordered_map<uint64_t, LiveImplHook> g_live_impl; // method_addr → state
@@ -720,14 +721,27 @@ duk_ret_t js_installImplHook(duk_context* ctx) {
     MethodSnapshot ms;
     ms.address = method;
 
-    // Free any previous trampoline installed for this Method* address.
+    // Free any previous trampoline installed for this Method* address,
+    // AND drop the corresponding JsImplEntry (else its 264KB ring +
+    // cookie remain in g_js_impl.entries forever and hot install/
+    // uninstall loops accumulate megabytes + linear-scan slowdown).
+    uint64_t prev_cookie = 0;
     {
         std::lock_guard<std::mutex> lk(g_live_impl_mu);
         auto it = g_live_impl.find(method);
         if (it != g_live_impl.end()) {
+            prev_cookie = it->second.cookie;
             try { it->second.hook.uninstall(); } catch (...) {}
             g_live_impl.erase(it);
         }
+    }
+    if (prev_cookie) {
+        std::lock_guard<std::mutex> g(g_js_impl.mu);
+        auto& v = g_js_impl.entries;
+        v.erase(std::remove_if(v.begin(), v.end(),
+            [prev_cookie](const std::unique_ptr<JsImplEntry>& e){
+                return e && e->cookie == prev_cookie;
+            }), v.end());
     }
 
     MethodHook hk = install_callback_hook_full(vm, ms, &on_js_impl_hook, cookie);
@@ -738,7 +752,7 @@ duk_ret_t js_installImplHook(duk_context* ctx) {
 
     {
         std::lock_guard<std::mutex> lk(g_live_impl_mu);
-        g_live_impl[method] = LiveImplHook{hk};
+        g_live_impl[method] = LiveImplHook{hk, cookie};
     }
 
     auto entry = std::make_unique<JsImplEntry>();
@@ -781,14 +795,29 @@ duk_ret_t js_uninstallImpl(duk_context* ctx) {
     uint64_t method = duk_require_uint(ctx, 0);
     uint64_t method_hi = duk_require_uint(ctx, 1);
     method |= (method_hi << 32);
-    bool removed = false;
+    bool     removed = false;
+    uint64_t cookie  = 0;
     {
         std::lock_guard<std::mutex> lk(g_live_impl_mu);
         auto it = g_live_impl.find(method);
         if (it != g_live_impl.end()) {
+            cookie = it->second.cookie;
             try { it->second.hook.uninstall(); removed = true; } catch (...) {}
             g_live_impl.erase(it);
         }
+    }
+    // v0.5: also drop the JsImplEntry. Without this, every install/
+    // uninstall cycle leaks a 264KB ring buffer + makes dispatch
+    // slower (linear cookie lookup over an unbounded vector). 50
+    // cycles ≈ 13MB leaked, plus the test hangs on JDK 17 because
+    // dispatch lookup walks 50 entries per fire.
+    if (cookie) {
+        std::lock_guard<std::mutex> g(g_js_impl.mu);
+        auto& v = g_js_impl.entries;
+        v.erase(std::remove_if(v.begin(), v.end(),
+            [cookie](const std::unique_ptr<JsImplEntry>& e){
+                return e && e->cookie == cookie;
+            }), v.end());
     }
     duk_push_boolean(ctx, removed);
     return 1;
