@@ -6,6 +6,95 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-05-05
+
+The closure release. Every test passes strict mode on every supported
+runtime — JDK 8/11/17/21/25 **and** JRE 8/11/17/21/25, totalling 60/60
+(test suite × runtime) configurations green. The callOriginal hot-loop
+ceiling that v0.3 documented as "JVMTI-free limit" is gone on every
+JDK version: 5000/5000 hits sustained.
+
+### Phase 1 — JDK 21+ closure (empirical `_compiler_flags` detection)
+
+v0.4 hit 100% on JDK 8/11/17 by setting NOT_C1/C2_COMPILABLE bits in
+`Method::_access_flags`, but stalled at 18-70% on JDK 21+ where those
+bits relocated to `Method::_compiler_flags` — a field current vmStructs
+mainline doesn't expose. Phase 1 finds it empirically:
+
+- `field_size_from_type()` maps vmStructs `type_string` (`"u4"`,
+  `"address"`, `"AccessFlags"`, ...) to byte size.
+- `resolve_compiler_flags_offset()` walks Method's exposed fields,
+  sorts by offset, finds the unique 4-byte gap. On JDK 21+ this lands
+  at offset 48 between `_vtable_index@44+4` and `_intrinsic_id@52` —
+  exactly where `_compiler_flags` lives. JDK 8/11/17 also have a u4
+  gap (different offset) but the bits there don't drive JIT decisions
+  on those JDKs, so we keep the access_flags-high-bits write as a
+  parallel path. **Both writes happen unconditionally** — extras are
+  no-op on the wrong JDK.
+
+Result: 5000/5000 callOriginal hits across JDK 21/25 (was 900/3500).
+
+### Phase 2 — JsImplEntry leak fix
+
+Each `.implementation = fn` install pushed an entry into
+`g_js_impl.entries` (containing a 264KB ring buffer). Uninstall only
+removed from `g_live_impl` (method_addr → hook), not from
+`g_js_impl.entries`. 50 install/uninstall cycles leaked ~13MB and
+made dispatch O(N) on cookie lookup, eventually hanging the
+install_loop_50 stress on JDK 17/21/25.
+
+- `LiveImplHook` now carries the cookie alongside the MethodHook.
+- `js_uninstallImpl` and the implicit-uninstall path in `js_installImpl`
+  both `remove_if` the matching cookie from `g_js_impl.entries`.
+
+### Phase 3 — strict cross-JDK matrix + IPC timeout override
+
+Stress4's `install_uninstall_loop_50` takes ~35s on JDK 8 even after
+the leak fix (HotSpot housekeeping cost on the older JDK). Bumped
+`marrow.exe agent` IPC timeout from hardcoded 30s to
+`$MARROW_AGENT_TIMEOUT_SEC` (default 30s). Verify_stress4 sets it to
+150s for its batches.
+
+Result on JDK 8/11/17/21/25:
+| Suite           | Strict-mode result |
+|-----------------|--------------------|
+| agent_smoke     | 24/24 PASS         |
+| verify_stress   | 34/34 PASS         |
+| verify_stress2  | 13/13 PASS         |
+| verify_stress3  | 11/11 PASS         |
+| verify_stress4  | 5/5 PASS           |
+| verify_stress5  | 6/6 PASS           |
+
+**= 30/30 (test suite × JDK) configurations.**
+
+### Phase 4 — JRE compatibility
+
+Marrow attaches at the JVM level, so JRE distributions (no dev tools,
+same `jvm.dll`) should work identically. Validated:
+
+- `find_java()` extended with `runtime` parameter (`jdk` / `jre` /
+  `anyjre`); honors `$MARROW_TEST_RUNTIME=jre`.
+- `agent_smoke.py` now reads `MARROW_TEST_JDK` (matching the other
+  tests' env convention).
+- Downloaded Temurin standalone JRE 11/17/21/25 for testing; JDK 8
+  ships its own bundled `jre/` subtree.
+
+Same 30/30 configurations green on JRE side: **= 60/60 total**.
+
+### Files
+
+- `cpp/src/jvm/hooks.cpp` — `field_size_from_type`,
+  `resolve_compiler_flags_offset`, dual access_flags/compiler_flags
+  write at install time.
+- `cpp/src/script/agent_js.cpp` — entries-leak fix, cookie carried in
+  LiveImplHook.
+- `cpp/src/main.cpp` — agent IPC timeout override via env.
+- `tests/_paths.py` — JRE/runtime selection.
+- `tests/agent_smoke.py` — `MARROW_TEST_JDK` env honored.
+- `tests/verify_stress4.py` — bumps IPC timeout for slow batches.
+- `tests/diag_install_loop.py` — bisect harness used to find the
+  leak.
+
 ## [0.4.0] — 2026-05-05
 
 The hot-loop callOriginal ceiling fell. v0.3 honestly admitted ~7%

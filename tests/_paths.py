@@ -37,21 +37,56 @@ def _candidate_jdk_dirs() -> list[str]:
     return out
 
 
-def find_java(version: str = "17") -> str | None:
+def find_java(version: str = "17", *, runtime: str = None) -> str | None:
+    if runtime is None:
+        runtime = os.environ.get("MARROW_TEST_RUNTIME", "jdk")
     """Locate java.exe for `version` (e.g. "17", "8") under a JDKs dir.
 
-    Looks for `temurin-{version}-jdk/**/bin/java.exe` first; falls back to
-    any `*{version}*/bin/java.exe` for non-Temurin layouts.
+    `runtime`:
+        "jdk" (default) — looks for `temurin-{version}-jdk/.../bin/java.exe`
+                          OR (JDK 8 only) the JRE bundled inside the JDK.
+        "jre"           — Temurin/Adoptium standalone JRE distributions:
+                          `temurin-{version}-jre/.../bin/java.exe`. JDK 8
+                          falls back to the bundled jre/ inside the JDK.
+        "anyjre"        — best-effort: standalone JRE if installed,
+                          otherwise the JDK's bundled JRE (JDK 8) or
+                          falls through to JDK java.exe (which is a JRE
+                          + dev tools).
     """
+    def _search(rt: str) -> str | None:
+        for base in _candidate_jdk_dirs():
+            if not os.path.isdir(base):
+                continue
+            hits = glob.glob(
+                os.path.join(base, f"temurin-{version}-{rt}", "**", "bin", "java.exe"),
+                recursive=True)
+            if hits: return hits[0]
+        return None
+
+    if runtime == "jre":
+        # Standalone JRE first.
+        hit = _search("jre")
+        if hit: return hit
+        # Fallback: JDK 8 ships an internal jre/ tree.
+        for base in _candidate_jdk_dirs():
+            if not os.path.isdir(base):
+                continue
+            hits = glob.glob(
+                os.path.join(base, f"temurin-{version}-jdk", "**", "jre", "bin", "java.exe"),
+                recursive=True)
+            if hits: return hits[0]
+        return None
+
+    if runtime == "anyjre":
+        return find_java(version, runtime="jre") or find_java(version, runtime="jdk")
+
+    # runtime == "jdk"
+    hit = _search("jdk")
+    if hit: return hit
+    # Last-resort fallback: any installed Java with the version number.
     for base in _candidate_jdk_dirs():
         if not os.path.isdir(base):
             continue
-        # Preferred: Temurin layout
-        hits = glob.glob(
-            os.path.join(base, f"temurin-{version}-jdk", "**", "bin", "java.exe"),
-            recursive=True)
-        if hits: return hits[0]
-        # Fallback: any layout containing the version number
         hits = glob.glob(
             os.path.join(base, f"*{version}*", "**", "bin", "java.exe"),
             recursive=True)

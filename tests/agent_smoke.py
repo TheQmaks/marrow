@@ -407,7 +407,10 @@ def main() -> int:
         print(f"[FAIL] missing build artifacts: {PROBE} or {AGENT}",
               file=sys.stderr)
         return 2
-    version = os.environ.get("JDK_VERSION", "17")
+    # Honor either MARROW_TEST_JDK (other tests' convention) or
+    # JDK_VERSION (agent_smoke's original).
+    version = os.environ.get("MARROW_TEST_JDK") or \
+              os.environ.get("JDK_VERSION", "17")
     if len(sys.argv) > 1 and sys.argv[1].lstrip("-").isdigit():
         version = sys.argv[1].lstrip("-")
     java = find_java(version)
