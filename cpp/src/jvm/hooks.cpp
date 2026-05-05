@@ -16,6 +16,7 @@ namespace marrow {
 
 // Forward declarations for JIT-survival worker (defined later in TU).
 static void register_jit_watch(uint64_t method_addr, size_t code_off,
+                                size_t fie_off, size_t fce_off,
                                 size_t vep_off_nm, size_t vep_off_cm,
                                 uint64_t ctx_addr,
                                 uint64_t tramp_addr,
@@ -288,6 +289,8 @@ MethodHook install_callback_hook(VMMeta* vm, const MethodSnapshot& method,
 struct JitWatchEntry {
     uint64_t method_addr;
     size_t   code_off;          // Method::_code byte offset
+    size_t   fie_off;            // Method::_from_interpreted_entry byte offset
+    size_t   fce_off;            // Method::_from_compiled_entry byte offset
     size_t   vep_off_nmethod;   // nmethod::_verified_entry_point (or 0)
     size_t   vep_off_cmethod;   // CompiledMethod::_verified_entry_point (or 0)
     uint64_t ctx_addr;
@@ -307,6 +310,13 @@ __declspec(noinline)
 static bool seh_write_zero(uint64_t addr) {
     __try {
         *reinterpret_cast<volatile uint64_t*>(addr) = 0;
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+__declspec(noinline)
+static bool seh_write_u64(uint64_t addr, uint64_t val) {
+    __try {
+        *reinterpret_cast<volatile uint64_t*>(addr) = val;
         return true;
     } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
@@ -349,25 +359,31 @@ static void jit_watch_loop() {
         for (auto& entry : snapshot) {
             uint64_t code = seh_read_u64(entry.method_addr + entry.code_off);
             if (!code || code == entry.last_seen_code) continue;
-            // New nmethod observed. Find its verified_entry_point.
+            // New nmethod observed.  Three things go stale on tier-up:
+            //   1. Method::_code now points at the new nmethod.
+            //   2. Method::_from_compiled_entry now points at nmethod's
+            //      verified entry — bypassing our trampoline.
+            //   3. Method::_from_interpreted_entry may be re-set to a
+            //      fresh c2i adapter — bypassing our trampoline too.
+            //   4. Inside the new nmethod itself, the verified_entry_point
+            //      stub is a direct compiled prologue. Existing JIT'd
+            //      callers may have inlined the call site to jump there
+            //      directly.
+            // Re-apply ALL four patches: re-write _fie & _fce back to
+            // our trampoline (so dispatch comes through us), zero _code
+            // (so the interpreter path stays preferred), and write a
+            // 14-byte abs-jmp at the nmethod's verified_entry_point so
+            // already-resolved JIT'd callers also land in our trampoline.
+            seh_write_u64(entry.method_addr + entry.fie_off, entry.tramp_addr);
+            seh_write_u64(entry.method_addr + entry.fce_off, entry.tramp_addr);
             uint64_t vep = 0;
             if (entry.vep_off_nmethod)
                 vep = seh_read_u64(code + entry.vep_off_nmethod);
             if (!vep && entry.vep_off_cmethod)
                 vep = seh_read_u64(code + entry.vep_off_cmethod);
-            // Patch the new vep with a direct abs-jmp to our existing
-            // FULL_TRAMP trampoline. The trampoline honors
-            // skip_orig / replace_rax, so .implementation = fn return-
-            // value replacement now works for JIT'd callers too —
-            // unlike v0.2.0's g_install_jit_detour route which couldn't
-            // bypass the original method body.
             if (vep && entry.tramp_addr) {
                 seh_write_abs_jmp(vep, entry.tramp_addr);
             }
-            // Force-back to interpreter path: zeroing _code makes
-            // HotSpot dispatch via _from_interpreted_entry on next call.
-            // (Belt-and-braces — even if the JIT vep patch raced, the
-            // interpreter trampoline still catches the call.)
             seh_write_zero(entry.method_addr + entry.code_off);
             {
                 std::lock_guard<std::mutex> lk(g_jit_watch_mu);
@@ -389,13 +405,15 @@ static void start_jit_watch_once() {
 }
 
 static void register_jit_watch(uint64_t method_addr, size_t code_off,
+                                size_t fie_off, size_t fce_off,
                                 size_t vep_off_nm, size_t vep_off_cm,
                                 uint64_t ctx_addr,
                                 uint64_t tramp_addr,
                                 uint64_t initial_code) {
     {
         std::lock_guard<std::mutex> lk(g_jit_watch_mu);
-        g_jit_watch.push_back({method_addr, code_off, vep_off_nm, vep_off_cm,
+        g_jit_watch.push_back({method_addr, code_off, fie_off, fce_off,
+                                vep_off_nm, vep_off_cm,
                                 ctx_addr, tramp_addr, initial_code});
     }
     start_jit_watch_once();
@@ -723,7 +741,8 @@ MethodHook install_callback_hook_full(VMMeta* vm, const MethodSnapshot& method,
         if (auto* f = cmt->field("_verified_entry_point"))
             vep_off_cm = f->offset;
     }
-    register_jit_watch(method.address, code_off, vep_off_nm, vep_off_cm,
+    register_jit_watch(method.address, code_off, fie_off, fce_off,
+                       vep_off_nm, vep_off_cm,
                        ctx_addr, /*tramp_addr=*/tramp,
                        /*initial_code=*/orig_code);
     return hk;
