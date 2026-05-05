@@ -6,6 +6,83 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-05-05
+
+JIT-survival worker thread. Promises from v0.1.9's known-limit
+delivered: a polling worker now catches HotSpot's tiered-compiler
+recompilations and re-patches new nmethods.
+
+### Architectural change: JIT-survival worker
+
+A new worker thread spawns lazily on first hook install and runs
+until the agent is unloaded. Every 5ms it walks every registered
+hook, reads `Method::_code` (the active nmethod pointer), and on
+detecting a fresh nmethod (different from the one we last patched):
+
+1. Reads the new nmethod's `_verified_entry_point` (via vmStructs
+   offset on either `nmethod` or `CompiledMethod` depending on JDK).
+2. Re-patches it via the existing inline-hook engine
+   (`g_install_jit_detour`) to redirect to `marrow_hook_dispatch`.
+3. Uninstalls the previous detour for that hook.
+4. Zeros `Method::_code` to force the next dispatch back through
+   the interpreter path (also hooked).
+
+All `__try`-protected against post-class-unloading invalid reads.
+Mutex-guarded watchlist (`g_jit_watch`) tracks per-hook state
+including the last-seen `_code` so we don't re-detour the same
+nmethod on every tick.
+
+### Effect (measured on JDK 17, 5000-iteration tight loop)
+
+|                                  | v0.1.9 | v0.2.0 | improvement |
+|----------------------------------|--------|--------|-------------|
+| Observer hook fires (.attach)    |    271 |  3070  | **11x** |
+| Replacement hook fires (.implementation handler runs) | 271 | 3070 | **11x** |
+| Replacement return value applied | 271    |   271  | unchanged |
+
+The handler-fires improvement covers the canonical Frida observer
+use-case (logging, tracing, side-effect callbacks). The unchanged
+"return value applied" reflects an architectural limit: the inline-
+hook engine that patches new nmethods doesn't honor the trampoline's
+skip_orig/replace_rax convention — after the dispatcher returns,
+the JIT'd nmethod's body runs to completion. Sync replacement under
+sustained JIT-tier-up therefore still falls back to original return
+values for ~94% of post-tier-up calls.
+
+Workaround when full replacement is required: run with `-Xint` (no
+JIT) or call `Marrow._deoptimizeAll()` periodically.
+
+### Added
+
+- `cpp/src/jvm/hooks.cpp`: `register_jit_watch` / `unregister_jit_watch`,
+  `jit_watch_loop`, `start_jit_watch_once`. SEH-guarded
+  `seh_read_u64` / `seh_write_zero` helpers.
+- `MethodHook::uninstall` now de-registers from the watcher BEFORE
+  reverting Method dispatch slots so the worker can't race a tear-down.
+
+### Verified
+
+```
+agent_smoke    24/24 PASS on all 5 JDKs (no regression)
+verify_stress  34/34 PASS on JDK 17
+verify_stress2 13/13 PASS on JDK 17
+verify_stress3 11/11 PASS on JDK 17
+verify_stress4  5/5  PASS on JDK 17
+verify_stress5  6/6  PASS on JDK 17
+```
+
+Worker thread runs throughout — no observed leaks, no crashes
+across the matrix.
+
+### Future work (v0.3+)
+
+The architectural step still missing: teach the inline-hook engine
+to honor skip_orig / replace_rax so JIT'd-call replacement matches
+interpreter-path replacement. This requires a different detour
+strategy (e.g. patching the nmethod's prologue with a tail-jump
+that honors a return-replacement convention). Substantial work,
+deferred.
+
 ## [0.1.9] — 2026-05-05
 
 Self-driven fifth stress round (`tests/verify_stress5.py`) covering

@@ -1,13 +1,30 @@
 #include "hooks.hpp"
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include <windows.h>
 #include <tlhelp32.h>
 
 namespace marrow {
+
+// Forward declarations for JIT-survival worker (defined later in TU).
+static void register_jit_watch(uint64_t method_addr, size_t code_off,
+                                size_t vep_off_nm, size_t vep_off_cm,
+                                uint64_t ctx_addr,
+                                uint64_t initial_code,
+                                int initial_detour_id);
+static void unregister_jit_watch(uint64_t method_addr);
+extern "C" void marrow_hook_dispatch(HookContext* ctx,
+                                       uint64_t* saved_regs,
+                                       uint64_t* saved_rbx_ptr,
+                                       uint64_t via);
 
 // Function-pointer indirection so marrow_core.lib doesn't link-time
 // require symbols that only exist in marrow_agent.dll (the inline-hook
@@ -78,6 +95,10 @@ uint64_t MethodHook::read_count() const {
 void MethodHook::uninstall() {
     Reader* r = vm->reader();
     const TypeInfo* mt = vm->type("Method");
+    // Pull this method out of the JIT-survival watcher's polling list
+    // BEFORE we revert dispatch slots. Otherwise the worker thread
+    // could re-zero _code while our restore is in flight.
+    unregister_jit_watch(method.address);
     // Tear down the JIT detour FIRST so the verified entry stops sending
     // events into ctx — otherwise an in-flight JIT'd caller could fire after
     // we've nulled _code and reverted the Method dispatch slots.
@@ -249,6 +270,123 @@ MethodHook install_callback_hook(VMMeta* vm, const MethodSnapshot& method,
 //   r8  = ptr to saved-rbx slot (also gives us rflags + retaddr nearby)
 // The dispatcher copies registers into ctx->regs[] using AMD64 reg-number
 // indexing, snapshots 16 stack qwords, then invokes ctx->cb_ptr(ctx).
+
+// ---------------------------------------------------------------------------
+// JIT-survival worker. HotSpot's tiered compiler installs a fresh nmethod
+// after a few hundred invocations of a hooked method; the new nmethod's
+// verified_entry_point is what JIT'd callers will jump to. Without this
+// worker, the original install_callback_hook_full's vep-patch only
+// covers the nmethod that existed at install time. Any later
+// recompilation produces a fresh nmethod we never patched.
+//
+// The worker runs at 5ms tick, walks every registered hook, and on
+// detecting a *new* Method::_code (i.e., last_seen_code != current),
+// patches the new vep via the inline-hook engine and zeros _code so
+// subsequent dispatch falls back to the interpreter path (also hooked
+// via _from_interpreted_entry).
+// ---------------------------------------------------------------------------
+struct JitWatchEntry {
+    uint64_t method_addr;
+    size_t   code_off;          // Method::_code byte offset
+    size_t   vep_off_nmethod;   // nmethod::_verified_entry_point (or 0)
+    size_t   vep_off_cmethod;   // CompiledMethod::_verified_entry_point (or 0)
+    uint64_t ctx_addr;
+    uint64_t last_seen_code;
+    int      jit_detour_id;     // current detour id (or <0)
+};
+static std::mutex g_jit_watch_mu;
+static std::vector<JitWatchEntry> g_jit_watch;
+static std::atomic<bool> g_jit_thread_started{false};
+
+__declspec(noinline)
+static uint64_t seh_read_u64(uint64_t addr) {
+    __try { return *reinterpret_cast<volatile uint64_t*>(addr); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+__declspec(noinline)
+static bool seh_write_zero(uint64_t addr) {
+    __try {
+        *reinterpret_cast<volatile uint64_t*>(addr) = 0;
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static void jit_watch_loop() {
+    using namespace std::chrono_literals;
+    while (true) {
+        std::this_thread::sleep_for(5ms);
+        std::vector<JitWatchEntry> snapshot;
+        {
+            std::lock_guard<std::mutex> lk(g_jit_watch_mu);
+            snapshot = g_jit_watch;
+            if (snapshot.empty()) continue;
+        }
+        for (auto& entry : snapshot) {
+            uint64_t code = seh_read_u64(entry.method_addr + entry.code_off);
+            if (!code || code == entry.last_seen_code) continue;
+            // New nmethod observed. Find its verified_entry_point.
+            uint64_t vep = 0;
+            if (entry.vep_off_nmethod)
+                vep = seh_read_u64(code + entry.vep_off_nmethod);
+            if (!vep && entry.vep_off_cmethod)
+                vep = seh_read_u64(code + entry.vep_off_cmethod);
+            int new_detour = -1;
+            if (vep && g_install_jit_detour) {
+                if (entry.jit_detour_id >= 0 && g_uninstall_jit_detour) {
+                    try { g_uninstall_jit_detour(entry.jit_detour_id); } catch (...) {}
+                }
+                try {
+                    new_detour = g_install_jit_detour(
+                        reinterpret_cast<void*>(vep),
+                        entry.ctx_addr,
+                        reinterpret_cast<uint64_t>(&marrow_hook_dispatch),
+                        /*via=*/1);
+                } catch (...) { new_detour = -1; }
+            }
+            // Force-back to interpreter path: zeroing _code makes
+            // HotSpot dispatch via _from_interpreted_entry on next call.
+            seh_write_zero(entry.method_addr + entry.code_off);
+            // Persist the new state in the master list.
+            {
+                std::lock_guard<std::mutex> lk(g_jit_watch_mu);
+                for (auto& e : g_jit_watch) {
+                    if (e.method_addr == entry.method_addr) {
+                        e.last_seen_code = code;
+                        e.jit_detour_id  = new_detour;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void start_jit_watch_once() {
+    bool expected = false;
+    if (!g_jit_thread_started.compare_exchange_strong(expected, true)) return;
+    std::thread(jit_watch_loop).detach();
+}
+
+static void register_jit_watch(uint64_t method_addr, size_t code_off,
+                                size_t vep_off_nm, size_t vep_off_cm,
+                                uint64_t ctx_addr,
+                                uint64_t initial_code,
+                                int initial_detour_id) {
+    {
+        std::lock_guard<std::mutex> lk(g_jit_watch_mu);
+        g_jit_watch.push_back({method_addr, code_off, vep_off_nm, vep_off_cm,
+                                ctx_addr, initial_code, initial_detour_id});
+    }
+    start_jit_watch_once();
+}
+
+static void unregister_jit_watch(uint64_t method_addr) {
+    std::lock_guard<std::mutex> lk(g_jit_watch_mu);
+    g_jit_watch.erase(
+        std::remove_if(g_jit_watch.begin(), g_jit_watch.end(),
+            [&](const JitWatchEntry& e){ return e.method_addr == method_addr; }),
+        g_jit_watch.end());
+}
 
 // Per-thread, per-cookie reentry guard. Lets a JS handler invoke the
 // original method without recursing into itself: handler sets the flag,
@@ -551,6 +689,22 @@ MethodHook install_callback_hook_full(VMMeta* vm, const MethodSnapshot& method,
     hk.jit_detour_id = jit_id;
     hk.jit_detour_va = verified_entry;       // even if detour failed, useful for diag
     hk.jit_detour_vep_src = vep_src;
+
+    // Spin up the JIT-survival watcher for this hook. Resolve the
+    // verified_entry_point offsets once (we already discovered which
+    // class — nmethod or CompiledMethod — exposes them above).
+    size_t vep_off_nm = 0, vep_off_cm = 0;
+    if (auto* nmt = vm->type("nmethod")) {
+        if (auto* f = nmt->field("_verified_entry_point"))
+            vep_off_nm = f->offset;
+    }
+    if (auto* cmt = vm->type("CompiledMethod")) {
+        if (auto* f = cmt->field("_verified_entry_point"))
+            vep_off_cm = f->offset;
+    }
+    register_jit_watch(method.address, code_off, vep_off_nm, vep_off_cm,
+                       ctx_addr, /*initial_code=*/orig_code,
+                       /*initial_detour_id=*/jit_id);
     return hk;
 }
 
