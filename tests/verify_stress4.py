@@ -127,8 +127,13 @@ def parse_reply(out):
 
 
 def eval_js(pid, js, label):
+    # Stress4 batches (install_loop_50 in particular) take ~35s on JDK 8
+    # — bump the agent IPC timeout above the default 30s so the slow-but-
+    # working path doesn't get killed mid-batch.
+    env = os.environ.copy()
+    env.setdefault("MARROW_AGENT_TIMEOUT_SEC", "150")
     r = subprocess.run([PROBE, "agent", str(pid), "eval", js],
-                       capture_output=True, text=True, timeout=120)
+                       capture_output=True, text=True, timeout=200, env=env)
     raw = parse_reply(r.stdout)
     if not raw:
         print(f"[FAIL] {label}: no reply"); print(r.stdout[:300]); return None

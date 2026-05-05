@@ -664,12 +664,18 @@ static int run_agent_send(DWORD pid, const std::string& cmd,
     b->request_id++;
     b->state = uint32_t(marrow::IpcState::Request);
 
-    // Wait for reply (bounded spin).
+    // Wait for reply (bounded spin). Default 30s; override with
+    // MARROW_AGENT_TIMEOUT_SEC for stress tests with heavy workloads.
+    int timeout_sec = 30;
+    if (const char* env = std::getenv("MARROW_AGENT_TIMEOUT_SEC")) {
+        int v = std::atoi(env);
+        if (v > 0) timeout_sec = v;
+    }
     auto start = std::chrono::steady_clock::now();
     while (b->state != uint32_t(marrow::IpcState::Reply)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        if (std::chrono::steady_clock::now() - start > std::chrono::seconds(30)) {
-            std::fprintf(stderr, "timeout waiting for agent reply\n");
+        if (std::chrono::steady_clock::now() - start > std::chrono::seconds(timeout_sec)) {
+            std::fprintf(stderr, "timeout waiting for agent reply (%ds)\n", timeout_sec);
             UnmapViewOfFile(b); CloseHandle(h);
             return 4;
         }
