@@ -1025,16 +1025,32 @@ R"JS(
         // Marrow._readArray returns null for invalid oops, an array
         // otherwise. Type-letter argument matches the element kind.
         var elemTypeChar = elem;
-        // Multi-dimensional arrays decode as object array (each elem is
-        // another array oop).
+        // Multi-dim arrays: outer slots hold OOPS to inner array objects.
+        // Read them as L (oop) regardless of leaf element kind, then
+        // recursively decode each inner array via _castArray with the
+        // tail signature (one fewer leading '[').
         if (depth > 1) elemTypeChar = 'L';
         var raw = null;
         try { raw = Marrow._readArray(oopHex, elemTypeChar, EAGER_LIMIT); }
         catch (e) { /* fall through with empty */ }
         var out = (raw && raw.length) ? raw.slice() : [];
-        // For object-element arrays, decode each oop into a cast'd
-        // proxy. Skips nulls and oops we can't decode.
-        if (elemTypeChar === 'L' && elemClass) {
+        if (depth > 1) {
+            // Recursive case: each element is an inner array (depth-1).
+            // Strip ONE leading '[' from sigFragment and recurse so a
+            // String[][] becomes a JS array of String[]-decoded JS
+            // arrays, an int[][] becomes a JS array of int[]-decoded
+            // (number-element) JS arrays, etc.
+            var innerSig = sigFragment.substring(1);
+            for (var ii = 0; ii < out.length; ++ii) {
+                var iv = out[ii];
+                if (typeof iv !== 'string' || iv === '0x0') {
+                    out[ii] = null; continue;
+                }
+                try { out[ii] = Java._castArray(iv, innerSig); }
+                catch (e) { /* leave raw oop */ }
+            }
+        } else if (elemTypeChar === 'L' && elemClass) {
+            // Single-dim object array: cast each element to leaf class.
             for (var i = 0; i < out.length; ++i) {
                 var v = out[i];
                 if (typeof v !== 'string' || v === '0x0') { out[i] = null; continue; }

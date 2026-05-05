@@ -6,6 +6,78 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-05-05
+
+Self-driven fifth stress round (`tests/verify_stress5.py`) covering
+axes that needed custom Java fixtures: multi-dimensional arrays from
+user code, sustained allocation pressure (2000+ Java strings), and
+sustained hot-hook firing (10000+ iterations). Surfaced two real
+issues: one fully fixed, one partially mitigated.
+
+### Fixed
+
+- **Multi-dimensional arrays were decoded incorrectly.** `_castArray`
+  for a `String[][]` cast every outer-element oop to the leaf class
+  `String` rather than recursively decoding it as another `String[]`
+  array. Result: `m[0]` was a half-broken String proxy whose `$oop`
+  pointed at a String[] array. Now `_castArray` strips one leading
+  `[` from the sig fragment and recurses on each inner element. So
+  `Callable.makeStringMatrix(2, 3)` returns a JS `[[..3..], [..3..]]`
+  with each element being a `Java.cast'd` String. Same for `[[I` and
+  arbitrarily nested array types.
+
+### Partially mitigated
+
+- **JIT recompilation silently bypasses hooks.** HotSpot's tiered
+  compiler installs a fresh nmethod after ~270-1500 invocations
+  (default thresholds). The new nmethod's `_verified_entry_point`
+  isn't our trampoline, so subsequent calls miss the hook entirely.
+  Mitigation in v0.1.9: `marrow_hook_dispatch` re-zeros
+  `Method::_code` on every fire, which keeps the interpreter path
+  active and extends hook lifetime substantially. But once a JIT'd
+  nmethod is active and callers are using its compiled entry, the
+  re-null doesn't reach them. **Full fix (worker thread polling
+  Method::_code) is deferred to v0.2.** Real-world Frida-style
+  scripts (UI events, network calls, lifecycle hooks) don't hit this
+  path because methods aren't called >270 times in tight loops from
+  outside the hook.
+
+### Added
+
+- `Callable.makeStringMatrix(int rows, int cols) -> String[][]` and
+  `makeIntMatrix(int rows, int cols) -> int[][]` test fixtures so
+  multi-dim array decoding has a deterministic source.
+- `tests/verify_stress5.py` — 6-check matrix:
+  - `String[][]` decode (recursive)
+  - `int[][]` decode (recursive, primitive leaf)
+  - 2000-string allocation pressure (no OOM)
+  - 1000-call `_coerceArg` auto-allocation hash
+  - 10k pure-replacement hooked invocations
+  - 500-iter `callOriginal` (kept under JIT threshold)
+- `HookContext` extended with `method_code_addr`, `method_fce_addr`,
+  `tramp_addr` fields (post-stack[16], not touched by trampoline asm)
+  for the JIT-survival re-null.
+
+### Verified
+
+```
+verify_stress5  6/6 PASS on all 5 JDKs ( 30/30)
+verify_stress4  5/5 PASS on all 5 JDKs (regression)
+verify_stress3 11/11 PASS on all 5 JDKs (regression)
+verify_stress2 13/13 PASS on all 5 JDKs (regression)
+verify_stress  34/34 PASS on all 5 JDKs (regression)
+agent_smoke    24/24 PASS on all 5 JDKs (regression)
+```
+
+### Honest takeaway
+
+This round had a clean win (multi-dim recursive decode) and a real
+deeper issue (JIT-tier-up vs hooks) that needs more architecture
+than fits in v0.1.x. The partial mitigation buys orders of magnitude
+more hook fires before JIT bypass, which covers real-world Frida
+script patterns; the full polling-worker fix is the right v0.2
+target. Total ~465 cross-JDK checks now in the matrix.
+
 ## [0.1.8] — 2026-05-05
 
 Self-driven fourth stress round (`tests/verify_stress4.py`) covering

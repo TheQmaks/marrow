@@ -18,4 +18,21 @@ public class Callable {
     // Object-arg tests. Return the arg's hashCode so we can verify identity.
     public static int strHash(String s) { return s == null ? -1 : s.hashCode(); }
     public static int strLen(String s)  { return s == null ? -1 : s.length(); }
+
+    // Multi-dimensional array fixtures for stress5. Stdlib doesn't
+    // naturally return [[X types, so we expose a factory here.
+    public static String[][] makeStringMatrix(int rows, int cols) {
+        String[][] m = new String[rows][cols];
+        for (int i = 0; i < rows; i++)
+            for (int j = 0; j < cols; j++)
+                m[i][j] = "r" + i + "c" + j;
+        return m;
+    }
+    public static int[][] makeIntMatrix(int rows, int cols) {
+        int[][] m = new int[rows][cols];
+        for (int i = 0; i < rows; i++)
+            for (int j = 0; j < cols; j++)
+                m[i][j] = i * 100 + j;
+        return m;
+    }
 }

@@ -346,6 +346,21 @@ extern "C" void marrow_hook_dispatch(HookContext* ctx,
         auto cb = reinterpret_cast<HookCallback>(ctx->cb_ptr);
         if (cb) cb(ctx);
         ctx->fire_count++;
+        // JIT-survival: HotSpot's tiered compiler installs a fresh
+        // nmethod after a few hundred invocations of a hooked method,
+        // bypassing our trampoline. Re-zero Method::_code on every
+        // fire so subsequent dispatches stay on the interpreter path
+        // (which still goes through _from_interpreted_entry, our
+        // trampoline). _from_compiled_entry is intentionally NOT
+        // rewritten: HotSpot may store an inline-cache stub there
+        // and overwriting kills cache invalidation. Wrapped in SEH
+        // so an unmapped Method (post-GC class-unloading) can't
+        // crash the dispatch.
+        if (ctx->method_code_addr) {
+            __try {
+                *reinterpret_cast<volatile uint64_t*>(ctx->method_code_addr) = 0;
+            } __except(1 /*EXCEPTION_EXECUTE_HANDLER*/) { /* swallow */ }
+        }
     }
 }
 
@@ -429,7 +444,7 @@ MethodHook install_callback_hook_full(VMMeta* vm, const MethodSnapshot& method,
     ctx.method = method.address;
     ctx.userdata = userdata;
     ctx.cb_ptr = reinterpret_cast<uint64_t>(cb);
-    r->write(ctx_addr, &ctx, sizeof(ctx));
+    // tramp_addr filled in below once trampoline is allocated.
 
     size_t fie_off = mt->field("_from_interpreted_entry")->offset;
     size_t fce_off = mt->field("_from_compiled_entry")->offset;
@@ -437,6 +452,16 @@ MethodHook install_callback_hook_full(VMMeta* vm, const MethodSnapshot& method,
     uint64_t orig_fie = r->read_u64(method.address + fie_off);
     uint64_t orig_fce = r->read_u64(method.address + fce_off);
     uint64_t orig_code = r->read_u64(method.address + code_off);
+
+    // JIT-survival: cache absolute addresses of Method::_code and
+    // Method::_from_compiled_entry so marrow_hook_dispatch can re-zero
+    // _code and re-write _from_compiled_entry on every fire. Without
+    // this, HotSpot's tiered JIT compiles the method after a few
+    // hundred invocations and the new nmethod bypasses our trampoline.
+    ctx.method_code_addr = method.address + code_off;
+    ctx.method_fce_addr  = method.address + fce_off;
+    // tramp_addr set after trampoline alloc below.
+    r->write(ctx_addr, &ctx, sizeof(ctx));
 
     uint64_t dispatch = reinterpret_cast<uint64_t>(&marrow_hook_dispatch);
 
@@ -451,6 +476,15 @@ MethodHook install_callback_hook_full(VMMeta* vm, const MethodSnapshot& method,
     uint8_t body[FULL_TRAMP_SIZE] = {};
     emit_full_trampoline(body, ctx_addr, /*via=*/0, dispatch, orig_fie);
     r->write(tramp, body, FULL_TRAMP_SIZE);
+
+    // Now that tramp is allocated, write its address into ctx so
+    // marrow_hook_dispatch can re-write Method::_from_compiled_entry
+    // back to it after a JIT recompile clobbered the field.
+    {
+        uint64_t tramp_addr_in_ctx = ctx_addr +
+            offsetof(HookContext, tramp_addr);
+        r->write(tramp_addr_in_ctx, &tramp, sizeof(tramp));
+    }
 
     // Read the nmethod's verified_entry_point BEFORE we null _code — that
     // address is what JIT'd callers have baked into their call sites, and

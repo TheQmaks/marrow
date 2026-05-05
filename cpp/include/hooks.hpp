@@ -69,6 +69,15 @@ struct HookContext {
     uint64_t replace_rax;  // value loaded into rax when skip_orig=1   (+48)
     uint64_t regs[16];     // RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8..R15  (+56)
     uint64_t stack[16];    // 16 qwords starting at original RSP       (+184)
+    // ---- JIT survival ---------------------------------------------- (+312)
+    // Set at install time. After every dispatch we re-zero _code and
+    // re-write _from_compiled_entry so JIT recompilations don't
+    // silently bypass our trampoline. Without these, hot hooks lose
+    // firing once HotSpot's tiered compiler kicks in (~270-1500
+    // invocations on JDK 17, default thresholds).
+    uint64_t method_code_addr;     // address of Method::_code           (+312)
+    uint64_t method_fce_addr;      // address of Method::_from_compiled_entry (+320)
+    uint64_t tramp_addr;           // our trampoline (re-applied to fce) (+328)
 };
 // Trampoline ASM hardcodes the offsets below — keep struct field layout
 // in sync with these constants:
