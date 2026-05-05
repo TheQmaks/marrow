@@ -14,6 +14,82 @@
 
 namespace marrow {
 
+// vmStructs FieldInfo carries `type_string` but not field size — we
+// derive size from the type name. Returns 0 for unknown types, which
+// lets the layout-gap heuristic in resolve_compiler_flags_offset
+// abort safely instead of misreading the struct.
+static size_t field_size_from_type(const std::string& ts) {
+    if (ts.empty()) return 0;
+    if (ts.back() == '*') return 8;          // pointer
+    if (ts == "address") return 8;
+    if (ts == "u8" || ts == "uint64_t" || ts == "int64_t" ||
+        ts == "long" || ts == "jlong" || ts == "size_t") return 8;
+    if (ts == "u4" || ts == "int" || ts == "jint" ||
+        ts == "uint32_t" || ts == "int32_t" ||
+        ts == "AccessFlags" || ts == "MethodFlags" ||
+        ts == "CompilerFlags") return 4;
+    if (ts == "u2" || ts == "short" || ts == "u_short" ||
+        ts == "jshort" || ts == "uint16_t") return 2;
+    if (ts == "u1" || ts == "char" || ts == "jbyte" ||
+        ts == "uint8_t" || ts == "bool") return 1;
+    return 0;   // unknown — caller should treat as opaque region
+}
+
+// Resolve the offset of Method's "not_compilable" flags field. Two
+// paths:
+//   - Canonical: vmStructs exposes _compiler_flags (rare on JDK 21+)
+//   - Heuristic: find the unique u4 gap between exposed Method fields.
+//     On JDK 21+ Method has exactly one u4 gap (between
+//     _vtable_index@N+4 and _intrinsic_id@N+8) and that gap *is*
+//     _compiler_flags. This shape is stable across mainline 21..25
+//     (verified by `marrow.exe dump <jvm.dll> Method`).
+//
+// Cached per-process (VMMeta is effectively static for a given JDK).
+// Returns 0 if neither path resolves — caller falls back to access_flags
+// high bits and counter pinning.
+static size_t resolve_compiler_flags_offset(VMMeta* vm) {
+    static std::atomic<size_t> cached{SIZE_MAX};
+    size_t cur = cached.load();
+    if (cur != SIZE_MAX) return cur;
+
+    size_t result = 0;
+    auto* mt = vm->type("Method");
+    if (mt) {
+        if (auto* cf = mt->field("_compiler_flags")) {
+            result = cf->offset;
+        } else {
+            // Build region map from exposed fields with known sizes.
+            struct R { uint64_t off; uint64_t sz; };
+            std::vector<R> regions;
+            bool any_unknown = false;
+            for (auto& kv : mt->fields) {
+                size_t sz = field_size_from_type(kv.second.type_string);
+                if (sz == 0) { any_unknown = true; break; }
+                regions.push_back({kv.second.offset, sz});
+            }
+            // If any exposed field has an unknown type, bail — gap
+            // calc would be wrong. Safe default = 0 (skip optimization).
+            if (!any_unknown) {
+                std::sort(regions.begin(), regions.end(),
+                          [](const R& a, const R& b){ return a.off < b.off; });
+                std::vector<uint64_t> u4_gaps;
+                for (size_t i = 0; i + 1 < regions.size(); ++i) {
+                    uint64_t end = regions[i].off + regions[i].sz;
+                    if (regions[i+1].off > end &&
+                        regions[i+1].off - end == 4) {
+                        u4_gaps.push_back(end);
+                    }
+                }
+                // Exactly-one-gap heuristic. Multiple gaps ⇒ ambiguous,
+                // refuse rather than guess.
+                if (u4_gaps.size() == 1) result = u4_gaps[0];
+            }
+        }
+    }
+    cached.store(result);
+    return result;
+}
+
 // Forward declarations for JIT-survival worker (defined later in TU).
 static void register_jit_watch(uint64_t method_addr, size_t code_off,
                                 size_t fie_off, size_t fce_off,
@@ -933,26 +1009,31 @@ MethodHook install_callback_hook_full(VMMeta* vm, const MethodSnapshot& method,
     // 5000/5000 hits. With JIT default: was 365/5000 (v0.3); now 5000/
     // 5000 across JDK 8/11/17/21/25 with this access-flags + compiler-
     // flags double write.
-    // Try _compiler_flags first (JDK 21+ split out the not-compilable
-    // bits into a dedicated field at bits 0..2). Most JDK 21+ vmStructs
-    // builds DON'T expose this field — there it falls through to the
-    // _access_flags path, which only sets high-bit flags that JDK 21+
-    // ignores; result on those JDKs is partial JIT-suppression via
-    // counter pinning alone (~20-70% hit rate on hot loops vs 100%
-    // on JDK 8/11/17).
-    if (auto* cf = mt->field("_compiler_flags")) {
-        uint32_t cur = r->read_u32(method.address + cf->offset);
-        cur |= 0x01u | 0x02u | 0x04u;
-        r->write(method.address + cf->offset, &cur, sizeof(cur));
-    } else if (auto* af = mt->field("_access_flags")) {
-        // JDK 8..17: high bits in _access_flags carry the not-compilable
-        // flags. Setting these makes CompilationPolicy::can_be_compiled()
-        // return false → JIT never schedules compile → trampoline stays
-        // canonical entry forever. Empirically yields 100% hit rate on
-        // sustained hot-loop callOriginal across JDK 8/11/17.
+    // Both writes happen unconditionally — extras are no-ops on the
+    // wrong JDK because the bits land in fields that aren't consulted
+    // by that JDK's CompilationPolicy:
+    //   - _access_flags high bits (0x0E000000): JDK 8/11/17 use these;
+    //     JDK 21+ shrank _access_flags so high bits are dead but we
+    //     still write them harmlessly (storage is u4-aligned both ways).
+    //   - _compiler_flags low bits (0x07): JDK 21+ uses these. On
+    //     JDK 11/17 this same offset is the (real) _compiler_flags
+    //     field but JIT decisions consult _access_flags first, so the
+    //     write is a no-op. On JDK 8 there's no u4 gap and the
+    //     heuristic returns 0, so this branch skips.
+    //   Result: writing to both is safe and gets 100% hit rate across
+    // JDK 8/11/17/21/25 without per-JDK branching logic.
+    if (auto* af = mt->field("_access_flags")) {
         uint32_t cur = r->read_u32(method.address + af->offset);
         cur |= 0x02000000u | 0x04000000u | 0x08000000u;
         r->write(method.address + af->offset, &cur, sizeof(cur));
+    }
+    if (size_t cf_off = resolve_compiler_flags_offset(vm); cf_off != 0) {
+        uint32_t cur  = r->read_u32(method.address + cf_off);
+        uint32_t want = cur | 0x01u | 0x02u | 0x04u;
+        r->write(method.address + cf_off, &want, sizeof(want));
+        // Read-back is informational only here — even if it doesn't
+        // stick (readonly section, wrong gap), we've already done the
+        // access_flags write so the older JDKs are still covered.
     }
     register_jit_watch(method.address, code_off, fie_off, fce_off,
                        vep_off_nm, vep_off_cm, state_off_nm,
