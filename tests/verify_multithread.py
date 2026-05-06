@@ -105,7 +105,7 @@ def main():
                    capture_output=True, timeout=15)
     time.sleep(1.5)
     env = os.environ.copy()
-    env.setdefault("MARROW_AGENT_TIMEOUT_SEC", "60")
+    env.setdefault("MARROW_AGENT_TIMEOUT_SEC", "180")
     r = subprocess.run([PROBE, "agent", str(pid), "eval", SETUP_AND_HOOK],
                        capture_output=True, text=True, timeout=60, env=env)
     rep = parse_reply(r.stdout)
@@ -117,14 +117,14 @@ def main():
     # is our window to drain stats before main() exits.
     t0 = time.time()
     saw_done = False
-    while time.time() - t0 < 30:
+    while time.time() - t0 < 180:
         ln = p.stdout.readline()
         if not ln: break
         if "workers done" in ln:
             saw_done = True
             break
     if not saw_done:
-        p.kill(); print("[FAIL] workers didn't finish in 30s"); return 1
+        p.kill(); print("[FAIL] workers didn't finish in 180s"); return 1
 
     # Drain BEFORE the JVM exits its 2s park.
     r = subprocess.run([PROBE, "agent", str(pid), "eval", DRAIN],

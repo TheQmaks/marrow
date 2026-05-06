@@ -101,10 +101,10 @@ static void register_jit_watch(uint64_t method_addr, size_t code_off,
                                 uint64_t tramp_addr,
                                 uint64_t initial_code);
 static void unregister_jit_watch(uint64_t method_addr);
-extern "C" void marrow_hook_dispatch(HookContext* ctx,
-                                       uint64_t* saved_regs,
-                                       uint64_t* saved_rbx_ptr,
-                                       uint64_t via);
+extern "C" uint64_t marrow_hook_dispatch(HookContext* ctx,
+                                           uint64_t* saved_regs,
+                                           uint64_t* saved_rbx_ptr,
+                                           uint64_t via);
 
 // Function-pointer indirection so marrow_core.lib doesn't link-time
 // require symbols that only exist in marrow_agent.dll (the inline-hook
@@ -641,10 +641,22 @@ extern "C" uint64_t marrow_hook_dbg_fire_total()  { return g_dbg_fire_total.load
 extern "C" uint64_t marrow_hook_dbg_skip_reentry(){ return g_dbg_skip_reentry.load(); }
 extern "C" void     marrow_hook_dbg_reset()       { g_dbg_fire_total = 0; g_dbg_skip_reentry = 0; }
 
-extern "C" void marrow_hook_dispatch(HookContext* ctx,
-                                        uint64_t* saved_regs,
-                                        uint64_t* saved_rbx_ptr,
-                                        uint64_t via) {
+// Encoding: bit 63 = skip_orig flag; bits 0..62 = replace_rax (truncated
+// from 64-bit; bit 63 of replace_rax is reserved for the skip flag and
+// always cleared in the encoded value). On Windows x64 user-space
+// pointers are < 2^48, primitive return values fit easily, so the
+// 1-bit truncation is harmless in practice.
+//   The trampoline ASM reads rax (the function return value) directly
+// after dispatch returns and uses `test rax, rax; jns .orig` to branch.
+// No shared-memory probe of HookContext::skip_orig/replace_rax — that
+// was the v0.5 race documented in earlier dispatch comments.
+static constexpr uint64_t MARROW_SKIP_BIT = 1ULL << 63;
+static constexpr uint64_t MARROW_RAX_MASK = ~MARROW_SKIP_BIT;
+
+extern "C" uint64_t marrow_hook_dispatch(HookContext* ctx,
+                                           uint64_t* saved_regs,
+                                           uint64_t* saved_rbx_ptr,
+                                           uint64_t via) {
     // saved_regs (low → high address):
     //   [0]=r15 [1]=r14 [2]=r13 [3]=r12 [4]=r11 [5]=r10 [6]=r9 [7]=r8
     //   [8]=rdi [9]=rsi [10]=rbp [11]=rdx [12]=rcx [13]=rax
@@ -653,128 +665,124 @@ extern "C" void marrow_hook_dispatch(HookContext* ctx,
     // register-arg conventions.
     g_dbg_fire_total.fetch_add(1, std::memory_order_relaxed);
 
-    // Always reset skip_orig at start: stale value from a previous fire
-    // would otherwise cause this call to skip orig with a wrong rax.
-    //
-    // KNOWN LIMITATION (multi-thread): HookContext is shared across all
-    // threads invoking the same hooked method. Dispatch writes ctx->regs/
-    // stack/skip_orig/replace_rax outside of any cross-thread lock; the
-    // trampoline's read of ctx->skip_orig also happens after dispatch
-    // returns. Concurrent dispatchers from separate JVM threads can
-    // race on these slots, producing best-effort per-thread arg
-    // observation (verify_multithread.py reports ~0.025% drift in
-    // bucketing under 8-thread/5K-iter contention; total fire count
-    // and total handler-invocation count stay exact).
-    //   Proper fix requires either (a) thread-local shadow contexts
-    // with the trampoline reading skip/rax from per-thread stack, or
-    // (b) dispatch returning skip+rax in the function return value
-    // and the trampoline using rax instead of a memory probe. Both
-    // touch trampoline ASM. Out of scope for v0.5; tracked.
-    if (ctx) {
-        ctx->skip_orig    = 0;
-        ctx->replace_rax  = 0;
-    }
+    if (!ctx) return 0;
+
     // Reentry-guard short-circuit. When the JS handler is mid-callOriginal,
     // a re-fire on the same thread+cookie skips dispatch entirely — the
     // trampoline's tail-jmp to orig_fie still runs the original body.
-    if (ctx) {
+    {
         int* slot = find_reentry_slot(ctx->userdata, /*create=*/false);
         if (slot && *slot > 0) {
             g_dbg_skip_reentry.fetch_add(1, std::memory_order_relaxed);
-            return;
+            return 0;        // skip flag clear → trampoline jmps to orig
         }
     }
 
-    if (ctx) {
-        ctx->via = via;
-        ctx->regs[0]  = saved_regs[13];   // RAX
-        ctx->regs[1]  = saved_regs[12];   // RCX
-        ctx->regs[2]  = saved_regs[11];   // RDX
-        ctx->regs[3]  = saved_rbx_ptr[0]; // RBX (orig)
-        ctx->regs[4]  = reinterpret_cast<uint64_t>(saved_rbx_ptr) + 16;
-                                          // RSP at method-entry (= addr of retaddr)
-        ctx->regs[5]  = saved_regs[10];   // RBP
-        ctx->regs[6]  = saved_regs[9];    // RSI
-        ctx->regs[7]  = saved_regs[8];    // RDI
-        ctx->regs[8]  = saved_regs[7];    // R8
-        ctx->regs[9]  = saved_regs[6];    // R9
-        ctx->regs[10] = saved_regs[5];    // R10
-        ctx->regs[11] = saved_regs[4];    // R11
-        ctx->regs[12] = saved_regs[3];    // R12
-        ctx->regs[13] = saved_regs[2];    // R13
-        ctx->regs[14] = saved_regs[1];    // R14
-        ctx->regs[15] = saved_regs[0];    // R15
-        // Stack snapshot: [saved_rbx_ptr+16] is the original retaddr
-        // pushed by caller's CALL. Beyond that lies caller's frame /
-        // overflow args. Wrap in a SEH-style guard against bad reads.
-        uint64_t* stk = saved_rbx_ptr + 2;
-        __try {
-            for (int i = 0; i < 16; ++i) ctx->stack[i] = stk[i];
-        } __except(1 /*EXCEPTION_EXECUTE_HANDLER*/) {
-            for (int i = 0; i < 16; ++i) ctx->stack[i] = 0;
-        }
-        auto cb = reinterpret_cast<HookCallback>(ctx->cb_ptr);
-        if (cb) cb(ctx);
-        ctx->fire_count++;
-        // JIT-survival: HotSpot's tiered compiler installs a fresh
-        // nmethod after a few hundred invocations of a hooked method,
-        // bypassing our trampoline. Re-zero Method::_code on every
-        // fire so subsequent dispatches stay on the interpreter path
-        // (which still goes through _from_interpreted_entry, our
-        // trampoline). _from_compiled_entry is intentionally NOT
-        // rewritten: HotSpot may store an inline-cache stub there
-        // and overwriting kills cache invalidation. Wrapped in SEH
-        // so an unmapped Method (post-GC class-unloading) can't
-        // crash the dispatch.
-        if (ctx->method_code_addr) {
-            __try {
-                *reinterpret_cast<volatile uint64_t*>(ctx->method_code_addr) = 0;
-            } __except(1 /*EXCEPTION_EXECUTE_HANDLER*/) { /* swallow */ }
-        }
-        // v0.4 JIT-suppression: pin invocation counter to a saturated-
-        // negative value. Each fire is also the moment HotSpot's
-        // interpreter is about to inc the counter (we run BEFORE the
-        // real interpreter entry), so writing here guarantees the
-        // counter never reaches the C1/C2 compile threshold even if
-        // the worker thread hasn't yet observed MC allocation. Once
-        // counter is pinned, JIT never publishes an nmethod and the
-        // callOriginal path stays on the (always-hooked) interpreter
-        // entry indefinitely.
-        if (ctx->method_mc_addr) {
-            __try {
-                uint64_t mc = *reinterpret_cast<volatile uint64_t*>(
-                    ctx->method_mc_addr);
-                if (mc) {
-                    *reinterpret_cast<volatile uint32_t*>(
-                        mc + ctx->counter_pin_in_mc) = 0x80000000u;
-                }
-            } __except(1 /*EXCEPTION_EXECUTE_HANDLER*/) { /* swallow */ }
-        }
+    // v0.6 multi-thread fix: per-thread shadow context. The shared
+    // HookContext now carries only IMMUTABLE-after-install identity
+    // (method, userdata, cb_ptr, JIT-survival pointers). Dispatch
+    // writes per-thread regs/stack/skip/rax to thread-local storage,
+    // hands a stable pointer to cb, and never races concurrent
+    // dispatches from other JVM threads. Trampoline reads the encoded
+    // skip+rax from the function return value (rax) — no
+    // post-dispatch probe of shared memory remains.
+    static thread_local HookContext tls_ctx;
+
+    // Stable identity (immutable in shared ctx after install).
+    tls_ctx.method            = ctx->method;
+    tls_ctx.userdata          = ctx->userdata;
+    tls_ctx.cb_ptr            = ctx->cb_ptr;
+    tls_ctx.method_code_addr  = ctx->method_code_addr;
+    tls_ctx.method_fce_addr   = ctx->method_fce_addr;
+    tls_ctx.tramp_addr        = ctx->tramp_addr;
+    tls_ctx.method_mc_addr    = ctx->method_mc_addr;
+    tls_ctx.counter_pin_in_mc = ctx->counter_pin_in_mc;
+    // Per-fire init.
+    tls_ctx.via               = via;
+    tls_ctx.skip_orig         = 0;
+    tls_ctx.replace_rax       = 0;
+    tls_ctx.fire_count        = 0;   // diagnostic local; shared counter below.
+
+    tls_ctx.regs[0]  = saved_regs[13];   // RAX
+    tls_ctx.regs[1]  = saved_regs[12];   // RCX
+    tls_ctx.regs[2]  = saved_regs[11];   // RDX
+    tls_ctx.regs[3]  = saved_rbx_ptr[0]; // RBX (orig)
+    tls_ctx.regs[4]  = reinterpret_cast<uint64_t>(saved_rbx_ptr) + 16;
+                                          // RSP at method-entry
+    tls_ctx.regs[5]  = saved_regs[10];   // RBP
+    tls_ctx.regs[6]  = saved_regs[9];    // RSI
+    tls_ctx.regs[7]  = saved_regs[8];    // RDI
+    tls_ctx.regs[8]  = saved_regs[7];    // R8
+    tls_ctx.regs[9]  = saved_regs[6];    // R9
+    tls_ctx.regs[10] = saved_regs[5];    // R10
+    tls_ctx.regs[11] = saved_regs[4];    // R11
+    tls_ctx.regs[12] = saved_regs[3];    // R12
+    tls_ctx.regs[13] = saved_regs[2];    // R13
+    tls_ctx.regs[14] = saved_regs[1];    // R14
+    tls_ctx.regs[15] = saved_regs[0];    // R15
+    uint64_t* stk = saved_rbx_ptr + 2;
+    __try {
+        for (int i = 0; i < 16; ++i) tls_ctx.stack[i] = stk[i];
+    } __except(1 /*EXCEPTION_EXECUTE_HANDLER*/) {
+        for (int i = 0; i < 16; ++i) tls_ctx.stack[i] = 0;
     }
+
+    // Run the user callback against the per-thread shadow.
+    auto cb = reinterpret_cast<HookCallback>(tls_ctx.cb_ptr);
+    if (cb) cb(&tls_ctx);
+
+    // Bump shared-ctx fire_count under acquire-rel ordering. Diagnostic;
+    // not load-bearing, but cleaner than a torn read on the JVM side.
+    reinterpret_cast<std::atomic<uint64_t>*>(&ctx->fire_count)
+        ->fetch_add(1, std::memory_order_relaxed);
+
+    // JIT-survival housekeeping (idempotent writes — race-tolerant).
+    if (ctx->method_code_addr) {
+        __try {
+            *reinterpret_cast<volatile uint64_t*>(ctx->method_code_addr) = 0;
+        } __except(1 /*EXCEPTION_EXECUTE_HANDLER*/) { /* swallow */ }
+    }
+    if (ctx->method_mc_addr) {
+        __try {
+            uint64_t mc = *reinterpret_cast<volatile uint64_t*>(
+                ctx->method_mc_addr);
+            if (mc) {
+                *reinterpret_cast<volatile uint32_t*>(
+                    mc + ctx->counter_pin_in_mc) = 0x80000000u;
+            }
+        } __except(1 /*EXCEPTION_EXECUTE_HANDLER*/) { /* swallow */ }
+    }
+
+    // Encode skip + rax for the trampoline. cb wrote into tls_ctx
+    // (per-thread); reads here are race-free.
+    if (tls_ctx.skip_orig) {
+        return MARROW_SKIP_BIT | (tls_ctx.replace_rax & MARROW_RAX_MASK);
+    }
+    return 0;
 }
 
-// Trampoline now ~137 bytes (was 114) — added post-dispatch check of
-// HookContext::skip_orig at offset 40. When the dispatch C function (or
-// a sync handler invoked from there) sets that byte to 1, the trampoline
-// loads HookContext::replace_rax (offset 48) into rax and RETs to caller
-// instead of tail-jumping to orig_entry. This implements Frida-style
-// `.implementation = fn` semantics where the handler's return value
-// replaces the method's return.
+// Trampoline (v0.6 multi-thread fix). Saves all GPRs + rflags, calls
+// dispatch, parks dispatch's uint64_t return value into the saved-rax
+// slot before pops, then tests rax (= dispatch return after pop rax)
+// for the high bit. Bit 63 of rax is the "skip_orig" flag set by the
+// JS handler via dispatch's TLS shadow ctx; bits 0..62 carry the
+// replacement return value.
+//   No post-dispatch read of shared HookContext memory remains, so
+// concurrent dispatchers from multiple JVM threads don't race on
+// skip/rax flags.
 static constexpr size_t FULL_TRAMP_SIZE       = 160;
-static constexpr size_t FULL_CTX_PATCH        = 33;   // first mov rcx,ctx
+static constexpr size_t FULL_CTX_PATCH        = 33;   // mov rcx, ctx
 static constexpr size_t FULL_VIA_PATCH        = 49;
 static constexpr size_t FULL_DISPATCH_PATCH   = 59;
-static constexpr size_t FULL_CTX2_PATCH       = 103;  // second mov r10,ctx
-static constexpr size_t FULL_ORIG_PATCH       = 137;
+static constexpr size_t FULL_ORIG_PATCH       = 124;  // shifted from 137
 
 static size_t emit_full_trampoline(uint8_t* buf, uint64_t ctx_ptr,
                                     uint32_t via,
                                     uint64_t dispatch_ptr,
                                     uint64_t orig_entry)
 {
-    // Layout (offsets in comments, byte index of patch slots match
-    // the FULL_*_PATCH constants above):
-    static const uint8_t TEMPLATE[145] = {
+    // Layout (byte indices match the FULL_*_PATCH constants above):
+    static const uint8_t TEMPLATE[132] = {
         0x9C,                                                    // 00 pushfq
         0x53,                                                    // 01 push rbx
         0x48, 0x89, 0xE3,                                        // 02 mov rbx,rsp
@@ -790,34 +798,37 @@ static size_t emit_full_trampoline(uint8_t* buf, uint64_t ctx_ptr,
         0x48, 0xB8, 0,0,0,0,0,0,0,0,                             // 57 mov rax, dispatch_imm (imm @ 59)
         0xFF, 0xD0,                                              // 67 call rax
         0x48, 0x83, 0xC4, 0x20,                                  // 69 add rsp, 0x20
+        // Save dispatch's uint64_t return into the saved-rax slot
+        // BEFORE the pop sequence — pop rax will then reload it.
+        // Saved-rax slot lives at [rsp + 0x68] right after the +0x20
+        // home-space deallocation (13 slots above rsp = rax slot).
+        0x48, 0x89, 0x44, 0x24, 0x68,                            // 73 mov [rsp+0x68], rax
         0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C,
-        0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58,          // 73 pop r15..r8
-        0x5F, 0x5E, 0x5D, 0x5A, 0x59, 0x58,                      // 89 pop rdi,rsi,rbp,rdx,rcx,rax
-        0x48, 0x89, 0xDC,                                        // 95 mov rsp, rbx
-        0x5B,                                                    // 98 pop rbx
-        // skip_orig branch — preserves r10 for the c2i adapter on the
-        // .orig path (HotSpot c2i uses r10 to carry Method* in some
-        // builds). r10 is volatile per Win64, so the skip path can
-        // discard the saved value and just `add rsp,8`.
-        0x41, 0x52,                                              // 99  push r10
-        0x49, 0xBA, 0,0,0,0,0,0,0,0,                             // 101 mov r10, ctx_imm (imm @ 103)
-        0x41, 0xF6, 0x42, 0x28, 0x01,                            // 111 test byte [r10+0x28], 1
-        0x74, 0x0A,                                              // 116 jz .orig (rel +10 → 128)
-        0x49, 0x8B, 0x42, 0x30,                                  // 118 mov rax, [r10+0x30]
-        0x48, 0x83, 0xC4, 0x08,                                  // 122 add rsp, 8 (drop saved r10)
-        0x9D,                                                    // 126 popfq
-        0xC3,                                                    // 127 ret
-        // .orig:
-        0x41, 0x5A,                                              // 128 pop r10  (restore caller r10)
-        0x9D,                                                    // 130 popfq
-        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,                      // 131 jmp [rip+0]
-        0,0,0,0,0,0,0,0,                                         // 137 orig_entry imm64
+        0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58,          // 78 pop r15..r8
+        0x5F, 0x5E, 0x5D, 0x5A, 0x59, 0x58,                      // 94 pop rdi,rsi,rbp,rdx,rcx,rax
+        0x48, 0x89, 0xDC,                                        // 100 mov rsp, rbx
+        0x5B,                                                    // 103 pop rbx
+        // rax now holds dispatch's encoded skip+replace value.
+        // Test high bit; if set, this is "skip orig & return
+        // masked rax to caller". If clear, tail-jmp to orig_entry.
+        // popfq must come AFTER the conditional branch — it
+        // restores the caller's flags and would clobber our test
+        // result if done first.
+        0x48, 0x85, 0xC0,                                        // 104 test rax, rax
+        0x79, 0x08,                                              // 107 jns .orig (rel +8 → 117)
+        0x48, 0xD1, 0xE0,                                        // 109 shl rax, 1   (mask bit 63)
+        0x48, 0xD1, 0xE8,                                        // 112 shr rax, 1
+        0x9D,                                                    // 115 popfq
+        0xC3,                                                    // 116 ret
+        // .orig: (offset 117)
+        0x9D,                                                    // 117 popfq
+        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,                      // 118 jmp [rip+0]
+        0,0,0,0,0,0,0,0,                                         // 124 orig_entry imm64
     };
     std::memcpy(buf, TEMPLATE, sizeof(TEMPLATE));
     std::memcpy(buf + FULL_CTX_PATCH,      &ctx_ptr,      8);
     std::memcpy(buf + FULL_VIA_PATCH,      &via,          4);
     std::memcpy(buf + FULL_DISPATCH_PATCH, &dispatch_ptr, 8);
-    std::memcpy(buf + FULL_CTX2_PATCH,     &ctx_ptr,      8);
     std::memcpy(buf + FULL_ORIG_PATCH,     &orig_entry,   8);
     return sizeof(TEMPLATE);
 }

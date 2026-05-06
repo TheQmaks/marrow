@@ -6,6 +6,76 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-05-06
+
+Closes the multi-thread `HookContext` race that v0.5 documented as a
+known limitation: per-thread arg attribution is now exact (drift=0)
+under 8-thread × 5000-iter contention on every JDK we test.
+
+### What was racing
+
+`HookContext` is one allocation per hook, but N JVM threads invoking
+the hooked method all wrote into the same struct. v0.5 dispatch:
+
+- Wrote `ctx->regs[*]`, `ctx->stack[*]` outside any lock.
+- The cb (JS handler) read `ctx->regs[*]` inside Duktape's mutex —
+  but the writer side raced.
+- Tramp ASM read `ctx->skip_orig` (offset 40) and `ctx->replace_rax`
+  (offset 48) AFTER dispatch returned, also outside any lock.
+
+Concurrent dispatchers from separate JVM threads could overwrite each
+other's snapshots (~0.025% drift per `verify_multithread.py`) and
+race on the skip/rax flags (very narrow window, never actually
+observed but theoretically possible).
+
+### v0.6 attack: TLS shadow ctx + dispatch-return encoding
+
+Two coordinated changes:
+
+1. **Per-thread shadow `HookContext`.** Dispatch now keeps a
+   `static thread_local HookContext tls_ctx` and writes per-fire
+   regs/stack/skip/rax there instead of into the shared ctx. cb
+   receives `&tls_ctx` — same pointer type, but private to this
+   thread. Concurrent dispatchers don't touch each other's TLS.
+
+2. **Dispatch returns encoded skip+rax in `uint64_t`.** Bit 63 = skip
+   flag, bits 0..62 = replace_rax (1-bit truncation; safe on Windows
+   x64 where user-space pointers are < 2^48 and primitive returns
+   fit comfortably). Trampoline ASM rewritten:
+   - Old tail: `push r10; mov r10, ctx_imm; test [r10+0x28], 1; jz; mov rax, [r10+0x30]; ...`
+   - New tail: `mov [rsp+0x68], rax; (pops); test rax, rax; jns .orig; shl rax,1; shr rax,1; popfq; ret`
+
+   The `mov [rsp+0x68], rax` parks dispatch's return value into the
+   saved-rax slot before the pop sequence — `pop rax` later reloads
+   it. After all pops, rax = dispatch's encoded return; trampoline
+   tests its sign bit. No shared-memory probe, no `FULL_CTX2_PATCH`.
+
+Trampoline shrank from 145 to 132 bytes. The shared `HookContext`
+fields `skip_orig` and `replace_rax` stay in the struct for ABI
+compatibility but are no longer load-bearing — only the per-thread
+shadow's values are read.
+
+### Effect on `verify_multithread.py`
+
+| Stress         | v0.5 drift     | **v0.6 drift** |
+|----------------|----------------|----------------|
+| 4×500   = 2K   | varied         | **0** ✅        |
+| 8×1000  = 8K   | ~0-2           | **0** ✅        |
+| 8×5000  = 40K  | 6-10 (~0.025%) | **0** ✅        |
+
+JDK 8/11/17/21/25 all show drift=0 standalone. Plus full JDK 17
+regression suite preserved (smoke 24/24, stress[1-5] 69/69, example 14
+50000/50000).
+
+### Files
+
+- `cpp/src/jvm/hooks.cpp` — dispatch refactored to TLS shadow + uint64
+  return encoding; trampoline ASM rewritten; `FULL_CTX2_PATCH`
+  removed; size constants updated.
+- `tests/verify_multithread.py` — agent IPC timeout bumped (the new
+  dispatch path is slightly heavier per fire due to TLS struct copy);
+  workers-finish wait bumped from 30s to 180s.
+
 ## [0.5.0] — 2026-05-05
 
 The closure release. Every test passes strict mode on every supported
