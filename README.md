@@ -19,9 +19,13 @@ table. That's how a single binary works on JDK 8 through JDK 25.
 ## Status
 
 - **Platform.** Windows x64. Linux/macOS not on the roadmap.
-- **Compatibility.** HotSpot JDK 8, 11, 17, 21, 25.
-- **Maturity.** v0.1.0 — research-grade. Smoke tests green on all five JDKs;
-  APIs may still shift.
+- **Compatibility.** HotSpot JDK 8, 11, 17, 21, 25 — both JDK and JRE
+  distributions, on every supported GC (G1, Parallel, Serial,
+  Shenandoah, ZGC).
+- **Maturity.** v0.5.0 — every test suite passes strict mode on every
+  supported runtime. **60/60 (test-suite × runtime) configurations
+  green** as of release. APIs are settling; breaking changes from here
+  on get a clear changelog entry.
 
 ---
 
@@ -180,9 +184,38 @@ on this primitive.
 
 ---
 
+## JIT survival
+
+The hard problem with JS-driven JVM instrumentation is HotSpot's tiered
+compiler: install a hook on a hot method, and after a few hundred
+invocations HotSpot publishes a fresh nmethod whose verified entry point
+your trampoline doesn't cover. From v0.3 honest documentation (~7%
+hit-rate on sustained `callOriginal` hot loops) to v0.5 closure:
+
+- **Disable JIT for hooked methods at install time.** v0.4 sets the
+  `NOT_C1_COMPILABLE | NOT_C2_COMPILABLE | NOT_C2_OSR_COMPILABLE` bits
+  on `Method::_access_flags` (JDK 8/11/17). HotSpot's
+  `CompilationPolicy::can_be_compiled()` returns false → no nmethod
+  ever gets published → no publish/patch race for `callOriginal` to
+  lose.
+- **JDK 21+ relocated those bits** to a separate
+  `Method::_compiler_flags` field that current vmStructs mainline
+  doesn't expose. v0.5 finds it empirically — walks Method's exposed
+  fields, sorts by offset, identifies the unique 4-byte gap; that's
+  `_compiler_flags`. Verified via read-back; access_flags fallback
+  still fires in case the heuristic is wrong on a future JDK layout.
+
+Result: **5000/5000 hits** on sustained hot-loop `callOriginal`
+instrumentation, same as `-Xint` baseline, on every JDK 8 through 25.
+No JVMTI, no Attach API, no per-JDK hardcoded offsets in source code.
+
+---
+
 ## Cross-JDK matrix
 
-`tests/agent_smoke.py <jdk>` covers every command on every supported JDK:
+`tests/agent_smoke.py` covers every CLI/agent command on every supported
+JDK and GC combination. v0.5 also runs five stress suites strict mode
+across the full matrix (no flaky-test acceptance).
 
 | JDK | G1 | Parallel | Serial | Shenandoah | ZGC | wide oops |
 |-----|----|----------|--------|------------|-----|-----------|
@@ -192,18 +225,34 @@ on this primitive.
 | 21  | ✓  | ✓        | ✓      | ✓          | ✓ generational | ✓ |
 | 25  | ✓  | ✓        | ✓      | ✓          | ✓   | ✓ |
 
-Result on each: `agent_smoke 24/24 PASS · smoke_extended 22/22 PASS`.
+**v0.5 strict-mode regression matrix.** Six test suites × ten runtimes
+(JDK 8/11/17/21/25 + JRE 8/11/17/21/25) = **60/60 PASS**:
+
+| Suite          | JDK 8/11/17/21/25 | JRE 8/11/17/21/25 |
+|----------------|-------------------|-------------------|
+| agent_smoke    | 24/24 ×5          | 24/24 ×5          |
+| verify_stress  | 34/34 ×5          | 34/34 ×5          |
+| verify_stress2 | 13/13 ×5          | 13/13 ×5          |
+| verify_stress3 | 11/11 ×5          | 11/11 ×5          |
+| verify_stress4 | 5/5 ×5            | 5/5 ×5            |
+| verify_stress5 | 6/6 ×5            | 6/6 ×5            |
 
 Run the matrix yourself:
 
 ```powershell
-python tests/matrix_smoke.py        # Python out-of-process API
-python tests/matrix_cpp_smoke.py    # C++ CLI + injected agent
-```
+# Single JDK
+$env:MARROW_TEST_JDK = "17"
+python tests/agent_smoke.py
+foreach ($s in @('','2','3','4','5')) { python "tests/verify_stress$s.py" }
 
-The matrix loops over (JDK × GC × compressed-oops) and verifies that read,
-write, hook, alloc, clone-class, and instance enumeration all work in every
-combination.
+# JRE flavor — same tests, $MARROW_TEST_RUNTIME picks the runtime
+$env:MARROW_TEST_RUNTIME = "jre"
+python tests/agent_smoke.py
+
+# Out-of-process Python API matrix
+python tests/matrix_smoke.py        # ReadProcessMemory layer
+python tests/matrix_cpp_smoke.py    # CLI + injected agent
+```
 
 ---
 
@@ -227,6 +276,7 @@ has `App.java` plus one or more `.js` scripts:
 | `examples/11_object_arg`          | hook fn, `Java.cast(argOop, 'Klass')`   |
 | `examples/12_object_inspect`      | walk arg tree, decode nested Strings    |
 | `examples/13_ergonomic_cheat`     | full UI: hotkey toggles cheat suite     |
+| `examples/14_hotloop_survival`    | 50K-iter callOriginal under JIT — 100% |
 
 For the **out-of-process Python API** (no DLL injection, just
 `ReadProcessMemory`/`WriteProcessMemory`), see `examples/python/`. 18 standalone
@@ -243,9 +293,11 @@ hardware watchpoints, ZGC decoding, and more.
 - ZGC on JDK 21 requires `-XX:+ZGenerational` (legacy single-gen has no
   exported colour masks we can decode).
 - `Class.forName` reachability for cloned classes is blocked on JDK 21+
-  pending per-version offset RE.
-- Stripped `jvm.dll` works for everything (we don't need PDBs), but on JRE-only
-  builds a few JNI-routed paths fall back through the public JNI vtable.
+  pending per-version offset RE — it's the one feature not yet
+  data-driven.
+- Stripped `jvm.dll` works for everything (we don't need PDBs).
+  JRE-only distributions are fully supported as of v0.5 — the same
+  test matrix passes strict on every JRE we ship against.
 
 ---
 

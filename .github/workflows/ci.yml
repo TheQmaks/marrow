@@ -1,0 +1,112 @@
+name: ci
+
+# Multi-JDK regression matrix on every push and PR. Builds the agent +
+# CLI from source, then runs the full test suite (smoke + 5 stress
+# rounds) against each supported JDK. Mirrors what `python tests/...`
+# does locally, just farmed out across runners.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} · JDK ${{ matrix.jdk }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Marrow is Windows x64 only by design (PE/VirtualAllocEx-based
+        # injector + agent loader). Linux/macOS runners would need a
+        # different injection layer; deferred. Test surface stays
+        # cross-JDK.
+        os: [windows-2022]
+        jdk: ['8', '11', '17', '21', '25']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Temurin JDK ${{ matrix.jdk }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.jdk }}
+          architecture: x64
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Configure CMake
+        shell: pwsh
+        run: cmake -B cpp/build -G "Visual Studio 17 2022" -A x64 cpp
+
+      - name: Build agent + CLI (Release)
+        shell: pwsh
+        run: cmake --build cpp/build --config Release
+
+      - name: Compile test target classes
+        shell: pwsh
+        working-directory: tests/target
+        run: |
+          New-Item -ItemType Directory -Path build -Force | Out-Null
+          javac -d build *.java
+
+      - name: Stage Marrow JDK layout for tests/_paths.py
+        # tests look for $REPO/../jdks/temurin-${V}-jdk/.../bin/java.exe.
+        # Symlink the runner's resolved JAVA_HOME to that shape.
+        shell: pwsh
+        run: |
+          $root = Resolve-Path "$env:GITHUB_WORKSPACE/.."
+          $dst  = Join-Path $root "jdks"
+          New-Item -ItemType Directory -Path $dst -Force | Out-Null
+          $link = Join-Path $dst "temurin-${{ matrix.jdk }}-jdk"
+          if (Test-Path $link) { Remove-Item $link -Recurse -Force }
+          New-Item -ItemType Junction -Path $link -Target $env:JAVA_HOME | Out-Null
+          Get-ChildItem $link | Select-Object -First 3
+
+      - name: agent_smoke
+        shell: pwsh
+        env:
+          MARROW_TEST_JDK: ${{ matrix.jdk }}
+        run: python tests/agent_smoke.py
+
+      - name: verify_stress
+        shell: pwsh
+        env:
+          MARROW_TEST_JDK: ${{ matrix.jdk }}
+        run: python tests/verify_stress.py
+
+      - name: verify_stress2
+        shell: pwsh
+        env:
+          MARROW_TEST_JDK: ${{ matrix.jdk }}
+        run: python tests/verify_stress2.py
+
+      - name: verify_stress3
+        shell: pwsh
+        env:
+          MARROW_TEST_JDK: ${{ matrix.jdk }}
+        run: python tests/verify_stress3.py
+
+      - name: verify_stress4
+        shell: pwsh
+        env:
+          MARROW_TEST_JDK: ${{ matrix.jdk }}
+        run: python tests/verify_stress4.py
+
+      - name: verify_stress5
+        shell: pwsh
+        env:
+          MARROW_TEST_JDK: ${{ matrix.jdk }}
+        run: python tests/verify_stress5.py
+
+      - name: callOriginal hot-loop diagnostic
+        shell: pwsh
+        env:
+          MARROW_TEST_JDK: ${{ matrix.jdk }}
+        run: python tests/diag_callorig.py

@@ -63,6 +63,7 @@ PID=<pid_of_java>
 | **11** | **Object-arg modify** | hook fn, `Java.cast(argOop, ClassName)`, mutate fields |
 | **12** | **Multi-arg inspection** | same, decode every object arg incl. nested Strings |
 | **13** | **Ergonomic cheat suite** | full UI: hotkey toggles cheat suite via Java.onKey |
+| **14** | **JIT-survival hot loop** | 50K-iter callOriginal stays 100% under HotSpot tier-up — v0.5 highlight |
 
 ## Что мы НЕ делаем "из коробки"
 
