@@ -655,6 +655,21 @@ extern "C" void marrow_hook_dispatch(HookContext* ctx,
 
     // Always reset skip_orig at start: stale value from a previous fire
     // would otherwise cause this call to skip orig with a wrong rax.
+    //
+    // KNOWN LIMITATION (multi-thread): HookContext is shared across all
+    // threads invoking the same hooked method. Dispatch writes ctx->regs/
+    // stack/skip_orig/replace_rax outside of any cross-thread lock; the
+    // trampoline's read of ctx->skip_orig also happens after dispatch
+    // returns. Concurrent dispatchers from separate JVM threads can
+    // race on these slots, producing best-effort per-thread arg
+    // observation (verify_multithread.py reports ~0.025% drift in
+    // bucketing under 8-thread/5K-iter contention; total fire count
+    // and total handler-invocation count stay exact).
+    //   Proper fix requires either (a) thread-local shadow contexts
+    // with the trampoline reading skip/rax from per-thread stack, or
+    // (b) dispatch returning skip+rax in the function return value
+    // and the trampoline using rax instead of a memory probe. Both
+    // touch trampoline ASM. Out of scope for v0.5; tracked.
     if (ctx) {
         ctx->skip_orig    = 0;
         ctx->replace_rax  = 0;

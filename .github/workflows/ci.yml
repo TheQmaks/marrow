@@ -110,3 +110,15 @@ jobs:
         env:
           MARROW_TEST_JDK: ${{ matrix.jdk }}
         run: python tests/diag_callorig.py
+
+      - name: multi-thread hook stress (8 threads × 5000 iter)
+        shell: pwsh
+        env:
+          MARROW_TEST_JDK: ${{ matrix.jdk }}
+        run: python tests/verify_multithread.py
+
+      - name: example 14 (JIT-survival 50K iter)
+        shell: pwsh
+        env:
+          MARROW_TEST_JDK: ${{ matrix.jdk }}
+        run: python tests/verify_example_14.py
