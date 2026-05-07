@@ -8,9 +8,19 @@ name: ci
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
     branches: [main]
+
+# Tag pushes deliberately don't trigger CI: in our release flow tags
+# are always created after the commit lands on main (`git push origin
+# main; git push origin v1.0.0`), so the tag run is a strict
+# duplicate of the main run on the same SHA. GitHub auto-cancelled
+# one of the two duplicates, showing up as a flaky "cancelled" tag
+# run that typically caught the longest step (multi-thread on JDK
+# 11). Cosmetic only — main is always green — but cleaner to skip
+# the duplicate entirely.
+#   If a tag is ever pushed for a SHA that wasn't on main first,
+# manually re-run via `gh workflow run ci.yml --ref <tag>`.
 
 jobs:
   build-and-test:
