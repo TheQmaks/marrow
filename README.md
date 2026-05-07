@@ -277,11 +277,68 @@ has `App.java` plus one or more `.js` scripts:
 | `examples/12_object_inspect`      | walk arg tree, decode nested Strings    |
 | `examples/13_ergonomic_cheat`     | full UI: hotkey toggles cheat suite     |
 | `examples/14_hotloop_survival`    | 50K-iter callOriginal under JIT — 100% |
+| `examples/15_tls_trust_bypass`    | Defeat pinned X509TrustManager          |
+| `examples/16_request_observer`    | Async `.attach` HTTP request log        |
+| `examples/17_auth_intercept`      | Force login + log creds                 |
 
 For the **out-of-process Python API** (no DLL injection, just
 `ReadProcessMemory`/`WriteProcessMemory`), see `examples/python/`. 18 standalone
 scripts covering class walking, heap inspection, ConstantPool surgery,
 hardware watchpoints, ZGC decoding, and more.
+
+---
+
+## Performance
+
+Numbers from `tests/bench_hooks.py` on JDK 17, Windows x64, default
+GC. Workload: tight loop calling a static `addInts(int,int)` method
+through Marrow's JS proxy.
+
+| Variant                          | Per-op |
+|----------------------------------|--------|
+| Baseline (no hook, JS+JNI dispatch) | ~21 μs |
+| `.implementation = fn` overhead  | +0.3 μs |
+| Install latency (HookScopedSuspend) | ~450 ms per install/uninstall |
+
+The 21 μs baseline is dominated by Marrow's JS-side dispatch path
+(JNI surface vtable lookup + arg conversion); native Java calls
+without Marrow are sub-microsecond. The install latency reflects
+the SuspendThread/ResumeThread dance Marrow does around the entry-
+pointer patches; once installed, runtime overhead is negligible.
+
+For high-throughput observability, prefer `.attach` (async) over
+`.implementation` (sync); the async path writes to a per-cookie
+ring buffer and the JS handler runs at drain time, not on every
+fire.
+
+---
+
+## API stability (v1.0+)
+
+Marrow follows [Semantic Versioning](https://semver.org/) starting
+from v1.0.0. The public surface that's guaranteed stable:
+
+- **JS Frida-compat API**: `Java.use`, `Java.cast`, `Java.choose`,
+  `Java.invoke`, `Java.invokeStatic`, `Java.toString`, `Java.drain`,
+  `.implementation = fn`, `.attach(fn)`, `.callOriginal`, `.setReturn`.
+- **JS Marrow primitives**: `Marrow.log`, `Marrow._defineClassNative`,
+  `Marrow._invokeJC`, `Marrow._invokeJNI` and their argument shapes.
+- **CLI**: `marrow.exe inject`, `marrow.exe agent <pid> eval <js>`,
+  `marrow.exe dump`, `marrow.exe threads`, `marrow.exe classes`.
+- **Out-of-process Python API**: `VMMeta`, `Reader`, `ClassWalker`,
+  `OopDecoder`, `StringReader`.
+
+NOT covered by semver:
+- Internal C++ symbols (`marrow_hook_dispatch` ABI, `HookContext`
+  layout, trampoline ASM encoding) — these have changed across v0.4 →
+  v0.6 → v0.7 and may again.
+- Diagnostic helpers (`Marrow._dbg*`, internal probe scripts).
+- Empirical heuristics (e.g. `_compiler_flags` gap detection) — they
+  may pick a different offset on a future JDK without warning, but
+  the user-facing semantics ("hook stays valid under JIT") stays
+  guaranteed.
+
+Breaking changes to the stable surface trigger a major version bump.
 
 ---
 

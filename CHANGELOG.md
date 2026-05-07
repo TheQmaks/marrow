@@ -6,6 +6,123 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-05-07
+
+The closure release. Every architectural debt the project accumulated
+over its v0.x life is either solved or honestly documented as
+deliberate scope. Combined with the v0.6 multi-thread fix and the
+v0.5 cross-runtime 60/60 matrix, Marrow ships v1.0 with a stable
+public API and committed semver discipline going forward.
+
+### Stage A — cleanup
+
+- **`REENTRY_SLOTS` 32 → 64** (`hooks.cpp`). Doubled the cliff for
+  callOriginal across many concurrent hooks; 64 covers any plausible
+  script. Documented as tunable.
+- **`HookContext::skip_orig` / `replace_rax` doc updated.** Since v0.6
+  these are load-bearing only in the per-thread shadow ctx; dead in
+  the shared install ctx. Kept for ABI compat (the shadow uses the
+  same struct layout).
+
+### Stage B — JIT-detour shim supports `.implementation` (#2)
+
+`agent_inlhook.cpp:emit_v2_shim_with_via` now mirrors the FULL_TRAMP
+v0.6 encoding scheme: parks dispatch's `uint64` return into the
+saved-rax slot before pops, then `test rax, rax; jns .orig; shl/shr;
+ret`. JIT-detour'd nmethods now respect skip-orig semantics, not just
+observation. Shim alloc bumped 128 → 192 to fit the extended tail.
+
+### Stage C — `_compiler_flags` strict-vs-loose detection (#3)
+
+The unique-u4-gap heuristic was fragile against future HotSpot layouts
+that might add another u4 field. v1.0 splits detection into a strict
+pass (gap with u4+ neighbors on both sides; filters incidental u1/u2
+padding slack) and a loose fallback (any single u4 gap, taken only
+when strict finds none). Both paths still hit the read-back +
+access_flags parallel-write safety net at install. Multiple-strict-
+gaps now refused rather than guessed.
+
+### Stage D — `Class.forName` on JDK 21+ via `JNIEnv->DefineClass` (#1)
+
+The injection gap that v0.5 documented as blocked by SystemDictionary
+not being data-driven via vmStructs is closed on every JDK Marrow
+targets, without per-JDK SystemDictionary RE.
+
+`js_defineClassNative` now tries PDB-resolved `JVM_DefineClass` first;
+on null falls through to JNIEnv vtable slot 5 (`DefineClass`). Both
+paths register the resulting class with SystemDictionary, so
+`Class.forName(name)` finds it. End-to-end test
+(`verify_defineclass.py`): compile a TestPayload class with `static
+int magic() { return 0xCAFE; }`, push bytecode bytes via JS array,
+defineClassNative returns oop, `Java.use('TestPayload_v0_7').magic()`
+returns 51966 (= 0xCAFE).
+
+Cross-JDK 5/5 PASS: JDK 8 / 11 / 17 / 21 / 25.
+
+### Stage E — Cookbook: 3 vanilla-JVM examples (#10)
+
+Real-world script templates beyond the original 14 demos:
+
+- **`15_tls_trust_bypass`** — defeat pinned `X509TrustManager` by
+  hooking `checkServerTrusted` to a no-op. Vanilla-JVM equivalent of
+  Frida's "SSL re-pinning" recipe. App goes from `PINNED:
+  CERT_PINNED` to `BYPASSED`.
+- **`16_request_observer`** — async `.attach` observer on an
+  HTTP-style handler, drains 5 captured requests after the loop.
+  Equivalent of Frida's "log every Activity" recipe.
+- **`17_auth_intercept`** — `.implementation = fn` that logs
+  `(user, pass)` and returns `true` regardless. Equivalent of
+  Frida's "force-login" recipe.
+
+Cross-JDK validated via `verify_examples_15_17.py`: 3/3 PASS on
+JDK 8/11/17/21/25 (15/15 configurations).
+
+### Stage F — Performance benchmarks (#9)
+
+`tests/bench_hooks.py` measures per-fire overhead and install latency
+on a tight loop calling `Callable.addInts`. JDK 17 numbers documented
+in README's new Performance section: ~21 μs per call (baseline,
+JS+JNI dispatch dominated), +0.3 μs hook overhead, ~450 ms install
+latency (HookScopedSuspend cost). Production users now have concrete
+budget numbers instead of guessing.
+
+### Stage G — v1.0 release (#12)
+
+- `pyproject.toml`: 0.6.0 → **1.0.0**.
+- README's new "API stability" section commits to semver going
+  forward. Stable surface: JS Frida-compat API, Marrow primitives,
+  CLI, out-of-process Python API. Internal C++ ABI / heuristics
+  remain free to evolve.
+- All previous unsolved technical debts (#1, #2, #3) closed; the
+  documentation-only items (#4–#7, #11–#13) explicitly addressed
+  with comments + doc updates.
+
+### Files
+
+- `cpp/include/hooks.hpp`: dead-field doc.
+- `cpp/src/jvm/hooks.cpp`: REENTRY_SLOTS bump, strict gap heuristic.
+- `cpp/src/native/agent_inlhook.cpp`: shim skip-orig support.
+- `cpp/src/script/agent_javacall.cpp`: dual-path defineClass.
+- `examples/15_tls_trust_bypass/`, `16_request_observer/`,
+  `17_auth_intercept/`: new cookbook trio.
+- `examples/README.md`, `README.md`: indexes + Performance + API
+  stability sections.
+- `tests/verify_defineclass.py`, `verify_examples_15_17.py`,
+  `bench_hooks.py`: new test/bench harnesses.
+- `pyproject.toml`: 1.0.0.
+- `CHANGELOG.md`: this entry.
+
+### Cross-runtime regression
+
+All v0.5 + v0.6 invariants preserved on every supported runtime:
+
+- **60/60** test-suite × runtime configurations green (JDK 8/11/17/21/25
+  + JRE 8/11/17/21/25 × smoke + verify_stress[1-5]).
+- Multi-thread drift = 0 on every JDK at 8×5000 contention.
+- callOriginal hot-loop = 100% (5000/5000) on every JDK.
+- Class.forName injection works on every JDK.
+- 3/3 cookbook examples PASS on every JDK.
+
 ## [0.6.0] — 2026-05-06
 
 Closes the multi-thread `HookContext` race that v0.5 documented as a

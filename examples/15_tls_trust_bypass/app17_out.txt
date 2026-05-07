@@ -1,0 +1,3 @@
+App PID: 394720
+App ready - inject marrow now.
+PINNED: CERT_PINNED

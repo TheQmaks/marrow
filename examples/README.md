@@ -64,6 +64,9 @@ PID=<pid_of_java>
 | **12** | **Multi-arg inspection** | same, decode every object arg incl. nested Strings |
 | **13** | **Ergonomic cheat suite** | full UI: hotkey toggles cheat suite via Java.onKey |
 | **14** | **JIT-survival hot loop** | 50K-iter callOriginal stays 100% under HotSpot tier-up — v0.5 highlight |
+| **15** | **TLS trust bypass** | Defeat pinned X509TrustManager — vanilla-JVM SSL pinning bypass |
+| **16** | **Request observer** | `.attach` async observer on HTTP-style handler |
+| **17** | **Auth intercept** | Force login=true + log creds via `.implementation` |
 
 ## Что мы НЕ делаем "из коробки"
 
