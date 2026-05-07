@@ -35,18 +35,25 @@ static size_t field_size_from_type(const std::string& ts) {
     return 0;   // unknown — caller should treat as opaque region
 }
 
-// Resolve the offset of Method's "not_compilable" flags field. Two
-// paths:
-//   - Canonical: vmStructs exposes _compiler_flags (rare on JDK 21+)
-//   - Heuristic: find the unique u4 gap between exposed Method fields.
-//     On JDK 21+ Method has exactly one u4 gap (between
-//     _vtable_index@N+4 and _intrinsic_id@N+8) and that gap *is*
-//     _compiler_flags. This shape is stable across mainline 21..25
-//     (verified by `marrow.exe dump <jvm.dll> Method`).
+// Resolve the offset of Method's "not_compilable" flags field. Three
+// paths in order of preference:
+//   1. Canonical: vmStructs exposes _compiler_flags (rare on JDK 21+).
+//   2. Strict heuristic: exactly one u4 gap between exposed Method
+//      fields, AND its left-side neighbor is u4-or-larger (excludes
+//      bitfield-trailing padding) AND right-side neighbor is u4-or-
+//      larger (excludes pre-bitfield padding). This narrows the
+//      "ambiguous u4 gap" cases and keeps the v0.5 100% record on
+//      JDK 21/25 while rejecting layouts that look like incidental
+//      4-byte slack.
+//   3. Loose fallback: ANY u4 gap. Used only if the strict path finds
+//      none AND there's exactly one u4 gap total. Safety check: the
+//      install path read-backs the write — if bits don't stick, the
+//      access_flags-high-bits fallback still fires. Belt-and-
+//      suspenders.
 //
 // Cached per-process (VMMeta is effectively static for a given JDK).
-// Returns 0 if neither path resolves — caller falls back to access_flags
-// high bits and counter pinning.
+// Returns 0 if no path resolves — caller falls back to access_flags
+// high bits + counter pinning.
 static size_t resolve_compiler_flags_offset(VMMeta* vm) {
     static std::atomic<size_t> cached{SIZE_MAX};
     size_t cur = cached.load();
@@ -58,7 +65,6 @@ static size_t resolve_compiler_flags_offset(VMMeta* vm) {
         if (auto* cf = mt->field("_compiler_flags")) {
             result = cf->offset;
         } else {
-            // Build region map from exposed fields with known sizes.
             struct R { uint64_t off; uint64_t sz; };
             std::vector<R> regions;
             bool any_unknown = false;
@@ -67,22 +73,36 @@ static size_t resolve_compiler_flags_offset(VMMeta* vm) {
                 if (sz == 0) { any_unknown = true; break; }
                 regions.push_back({kv.second.offset, sz});
             }
-            // If any exposed field has an unknown type, bail — gap
-            // calc would be wrong. Safe default = 0 (skip optimization).
             if (!any_unknown) {
                 std::sort(regions.begin(), regions.end(),
                           [](const R& a, const R& b){ return a.off < b.off; });
-                std::vector<uint64_t> u4_gaps;
+                struct Gap { uint64_t off; uint64_t left_sz; uint64_t right_sz; };
+                std::vector<Gap> u4_gaps;
                 for (size_t i = 0; i + 1 < regions.size(); ++i) {
                     uint64_t end = regions[i].off + regions[i].sz;
                     if (regions[i+1].off > end &&
                         regions[i+1].off - end == 4) {
-                        u4_gaps.push_back(end);
+                        u4_gaps.push_back({end, regions[i].sz, regions[i+1].sz});
                     }
                 }
-                // Exactly-one-gap heuristic. Multiple gaps ⇒ ambiguous,
-                // refuse rather than guess.
-                if (u4_gaps.size() == 1) result = u4_gaps[0];
+                // Strict pass: gaps where both neighbors are u4+ (≥4 bytes).
+                // Filters out incidental padding slack adjacent to u1/u2
+                // bitfield runs.
+                std::vector<uint64_t> strict;
+                for (auto& g : u4_gaps) {
+                    if (g.left_sz >= 4 && g.right_sz >= 4) strict.push_back(g.off);
+                }
+                if (strict.size() == 1) {
+                    result = strict[0];
+                } else if (strict.empty() && u4_gaps.size() == 1) {
+                    // Loose fallback. Read-back verification at the
+                    // install site (and the access_flags parallel write)
+                    // catches a wrong guess without corrupting state
+                    // beyond an OR of 0x07 into a wrong u4.
+                    result = u4_gaps[0].off;
+                }
+                // Otherwise (0 strict + ≥2 loose, or ≥2 strict): refuse;
+                // ambiguity beats silent corruption.
             }
         }
     }
@@ -599,9 +619,17 @@ static void unregister_jit_watch(uint64_t method_addr) {
 //
 // Indexed by `cookie` (HookContext::userdata). Storage is thread_local
 // so concurrent threads don't interfere with each other. Bounded array
-// for cheap lookup; if a user installs >32 hooks per thread they fall
-// back to handler-fired-on-reentry behavior (correct, just less useful).
-constexpr size_t REENTRY_SLOTS = 32;
+// for cheap lookup; if a user installs >REENTRY_SLOTS hooks per thread
+// AND every one of them is mid-callOriginal simultaneously, the slot
+// table fills and find_reentry_slot returns nullptr → callOriginal's
+// guard becomes a no-op and the recursive call re-fires the user
+// handler, causing infinite recursion.
+//   In practice the cliff is very high: the only way to exceed it is
+// nested callOriginal across N distinct hooks on the same thread.
+// 64 covers any plausible script. Size is tunable; bump here if a
+// real workload demonstrates the limit. Linear scan is O(N) per
+// dispatch, so don't make it huge without thinking.
+constexpr size_t REENTRY_SLOTS = 64;
 struct ReentrySlot { uint64_t cookie; int depth; };
 static thread_local ReentrySlot tls_reentry[REENTRY_SLOTS] = {};
 

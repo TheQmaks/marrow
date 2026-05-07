@@ -63,10 +63,19 @@ struct HookContext {
     uint64_t fire_count;   // dispatch-bumped counter                  (+16)
     uint64_t cb_ptr;       // HookCallback function pointer            (+24)
     uint64_t via;          // 0 = via _fie, 1 = via _fce               (+32)
-    uint8_t  skip_orig;    // dispatch sets to 1 → trampoline RET     (+40)
-                           //    instead of tail-jmp to orig
+    // skip_orig + replace_rax: as of v0.6 these are LOAD-BEARING ONLY
+    // in the per-thread shadow ctx (`tls_ctx` inside marrow_hook_dispatch),
+    // never read from the SHARED HookContext allocated at install.
+    // The trampoline reads dispatch's uint64_t return value (sign bit
+    // = skip flag, low 63 = replace_rax) directly via `test rax, rax`
+    // — no memory probe of these slots remains. Kept here for ABI
+    // compatibility (the shadow ctx has the same struct layout, and
+    // cb writes to skip_orig/replace_rax through the shadow pointer).
+    // Removing them entirely would require splitting HookContext into
+    // separate identity + scratch structs; deferred to a future major.
+    uint8_t  skip_orig;    // tls_ctx slot used by cb to signal skip   (+40)
     uint8_t  pad[7];       //                                          (+41..47)
-    uint64_t replace_rax;  // value loaded into rax when skip_orig=1   (+48)
+    uint64_t replace_rax;  // tls_ctx slot used by cb for replace val  (+48)
     uint64_t regs[16];     // RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8..R15  (+56)
     uint64_t stack[16];    // 16 qwords starting at original RSP       (+184)
     // ---- JIT survival ---------------------------------------------- (+312)

@@ -551,7 +551,7 @@ static int install_inline_hook(void* target_va) {
     //   9D                         popfq
     //   FF 25 00 00 00 00          jmp [rip+0]
     //   <tramp_addr_imm64>
-    void* shim_page = alloc_exec(128);
+    void* shim_page = alloc_exec(192);
     if (!shim_page) { free_exec(tramp_page); return -1; }
 
     // Allocate hook record NOW so we have a stable counter address.
@@ -754,7 +754,7 @@ static int install_inline_hook_v2(void* target_va) {
                     reinterpret_cast<uint64_t>(target) + plen);
 
     // Shim page.
-    void* shim_page = alloc_exec(128);
+    void* shim_page = alloc_exec(192);
     if (!shim_page) { free_exec(tramp_page); return -1; }
 
     // Hook record + V2 context.
@@ -838,6 +838,13 @@ static void emit_v2_shim_with_via(uint8_t* s, uint64_t ctx_ptr,
     emit({0x48, 0xB8}); emit64(dispatch_ptr);          // mov rax, dispatch_imm
     emit({0xFF, 0xD0});                                // call rax
     emit({0x48, 0x83, 0xC4, 0x20});                    // add rsp, 0x20
+    // v0.7: park dispatch's encoded skip+rax return into the saved-rax
+    // slot at [rsp + 0x68] BEFORE the pop sequence. pop rax later
+    // reloads our value. Mirrors the FULL_TRAMP fix from v0.6 — the
+    // JIT-detour path now also supports `.implementation = fn`
+    // skip-orig semantics on already-JIT'd nmethods, not just
+    // observation.
+    emit({0x48, 0x89, 0x44, 0x24, 0x68});              // mov [rsp+0x68], rax
     // pop r15..r8  (reverse of push order)
     emit({0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C,
           0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58});
@@ -845,10 +852,23 @@ static void emit_v2_shim_with_via(uint8_t* s, uint64_t ctx_ptr,
     emit({0x5F, 0x5E, 0x5D, 0x5A, 0x59, 0x58});
     emit({0x48, 0x89, 0xDC});                          // mov rsp, rbx
     emit({0x5B});                                      // pop rbx
+    // rax now holds dispatch's encoded skip+replace value. Bit 63
+    // set => skip orig and return masked rax to caller. Bit 63
+    // clear => fall through to original execution (jmp tramp_ptr).
+    emit({0x48, 0x85, 0xC0});                          // test rax, rax
+    emit({0x79, 0x07});                                // jns +7 → .orig
+    emit({0x48, 0xD1, 0xE0});                          // shl rax, 1
+    emit({0x48, 0xD1, 0xE8});                          // shr rax, 1
+    emit({0x9D});                                      // popfq
+    emit({0xC3});                                      // ret
+    // .orig: continue executing original at tramp_page (which has the
+    // first 14 bytes of the original method copied + an abs-jmp back
+    // to method+14).
     emit({0x9D});                                      // popfq
     emit({0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});        // jmp [rip+0]
     emit64(tramp_ptr);
-    // Total: ~120 bytes. Fits in 128-byte alloc.
+    // Total: ~135 bytes. Fits in 128-byte alloc... wait, 128 was tight.
+    // Bumped alloc to 192 in install_user_inline_detour.
 }
 
 // ---------------------------------------------------------------------------
@@ -881,7 +901,7 @@ extern "C" int marrow_install_user_inline_detour(void*    target_va,
     write_abs_jmp14(static_cast<uint8_t*>(tramp_page) + plen,
                     reinterpret_cast<uint64_t>(target) + plen);
 
-    void* shim_page = alloc_exec(128);
+    void* shim_page = alloc_exec(192);
     if (!shim_page) { free_exec(tramp_page); return -1; }
 
     InlineHook* h = new InlineHook();
