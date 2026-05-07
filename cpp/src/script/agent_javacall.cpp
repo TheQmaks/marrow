@@ -888,18 +888,28 @@ duk_ret_t js_invokeJC(duk_context* ctx) {
 // Marrow._defineClassNative(nameStr|null, bytesArray, loaderOopHex|null)
 //   -> Class oop hex string (or null on failure).
 //
-// Calls HotSpot's JVM_DefineClass directly — pure C entry point inside
-// jvm.dll, no Java implementation in the path. The byte buffer comes
-// from the JS array (copied into a malloc'd native buffer) so no Java
-// byte[] allocation is required either. The classloader oop is wrapped
-// in a JNI local handle just like the JVM does internally for the JNI
-// surface call.
+// Calls HotSpot's JVM_DefineClass directly when PDB resolution
+// succeeds; otherwise falls back to JNIEnv->DefineClass (vtable slot
+// 5) which is exposed unconditionally on every JDK and JRE. The
+// JNIEnv signature has one fewer arg (no protection_domain) but the
+// effect is the same — both paths register the resulting class with
+// SystemDictionary so subsequent Class.forName(name) can find it.
+//
+// This closes the JDK 21+ Class.forName injection gap that v0.5
+// documented as blocked by SystemDictionary not being data-driven via
+// vmStructs: defineClass via JNIEnv bypasses the SysDict-walking
+// path entirely, letting the user inject classes reachable through
+// canonical JLS lookup on every JDK.
 //
 // Returns the wide oop of the resulting Class<?> mirror, or null on
 // failure (parse error, name collision, OOM).
 // SEH-protected helpers (MSVC bans __try in functions with C++ destructors).
 typedef void* (*DefineClassFn)(void* env, const char* name, void* loader,
                                 const int8_t* buf, int len, void* pd);
+// JNIEnv->DefineClass: jclass(*)(JNIEnv*, const char*, jobject, const jbyte*, jsize)
+typedef void* (*JniDefineClassFn)(void* env, const char* name, void* loader,
+                                    const int8_t* buf, int len);
+constexpr size_t JNI_DefineClass = 5 * 8;
 __declspec(noinline)
 static void* call_make_local_seh(JniMakeLocalFn fn, void* thread, void* oop) {
     __try { return fn(thread, oop); }
@@ -910,6 +920,13 @@ static void* call_define_class_seh(DefineClassFn fn, void* env,
                                     const char* name, void* loader,
                                     const int8_t* buf, int len) {
     __try { return fn(env, name, loader, buf, len, nullptr); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+__declspec(noinline)
+static void* call_jni_define_class_seh(JniDefineClassFn fn, void* env,
+                                        const char* name, void* loader,
+                                        const int8_t* buf, int len) {
+    __try { return fn(env, name, loader, buf, len); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
 
@@ -933,17 +950,15 @@ duk_ret_t js_defineClassNative(duk_context* ctx) {
     if (duk_is_string(ctx, 2)) loader_hex = duk_get_string(ctx, 2);
 
     init_dbghelp();
-    if (!g_dbg_ok) { duk_push_null(ctx); return 1; }
     if (!ensure_attached()) { duk_push_null(ctx); return 1; }
     if (!resolve_all()) { duk_push_null(ctx); return 1; }
 
-    uint64_t jvm_define_va = resolve_symbol("JVM_DefineClass");
-    if (!jvm_define_va) { duk_push_null(ctx); return 1; }
-
     // Get JNIEnv via JavaVM->functions->GetEnv. main_vm is a JavaVM_
     // (just a pointer to a JNIInvokeInterface_ table). Slot [6] holds
-    // GetEnv(JavaVM*, void**, jint version).
+    // GetEnv(JavaVM*, void**, jint version). main_vm is xref-resolved
+    // (PDB-less safe).
     uint64_t* main_vm_ptr = reinterpret_cast<uint64_t*>(g_sym.main_vm_addr);
+    if (!main_vm_ptr) { duk_push_null(ctx); return 1; }
     uint64_t* fns = reinterpret_cast<uint64_t*>(*main_vm_ptr);
     typedef int (*GetEnvFn)(void* vm, void** penv, int version);
     auto get_env = reinterpret_cast<GetEnvFn>(fns[6]);
@@ -969,9 +984,39 @@ duk_ret_t js_defineClassNative(duk_context* ctx) {
         }
     }
 
-    auto define_fn = reinterpret_cast<DefineClassFn>(jvm_define_va);
-    void* jclass_handle = call_define_class_seh(
-        define_fn, env, name, loader_jobject, buf.data(), int(n));
+    void* jclass_handle = nullptr;
+
+    // Path 1: PDB-resolved JVM_DefineClass (preferred when symbols are
+    // available — slightly cheaper, avoids one indirection).
+    uint64_t jvm_define_va = g_dbg_ok ? resolve_symbol("JVM_DefineClass") : 0;
+    if (jvm_define_va) {
+        auto define_fn = reinterpret_cast<DefineClassFn>(jvm_define_va);
+        jclass_handle = call_define_class_seh(
+            define_fn, env, name, loader_jobject, buf.data(), int(n));
+    }
+
+    // Path 2: JNIEnv->DefineClass via vtable slot 5. PDB-less path used
+    // on stripped JREs and on JDK 21+ where JVM_DefineClass may not be
+    // exported. The JNI surface DefineClass also walks SystemDictionary
+    // registration — Class.forName(name) finds the class after either
+    // path returns.
+    if (!jclass_handle) {
+        void** vtable = seh_read_vtable(env);
+        if (vtable) {
+            auto get_slot = [&](size_t off) -> void* {
+                return *reinterpret_cast<void**>(
+                    reinterpret_cast<char*>(vtable) + off);
+            };
+            auto jni_define = reinterpret_cast<JniDefineClassFn>(
+                get_slot(JNI_DefineClass));
+            if (jni_define) {
+                jclass_handle = call_jni_define_class_seh(
+                    jni_define, env, name, loader_jobject,
+                    buf.data(), int(n));
+            }
+        }
+    }
+
     if (!jclass_handle) { duk_push_null(ctx); return 1; }
 
     // jclass is a JNI local handle — pointer to a slot containing the oop.
