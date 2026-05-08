@@ -223,72 +223,36 @@ struct Symbols {
 };
 static Symbols g_sym;
 
-// Forward decl from agent_pdbsym.cpp — we reuse its DbgHelp init. The
-// helper below resolves a symbol by source-form name and caches the result
-// internally. Keep this unit decoupled by re-loading via DbgHelp ourselves.
-static HMODULE g_dbg_h = nullptr;
-static decltype(&SymInitialize)   g_SymInitialize = nullptr;
-static decltype(&SymLoadModuleEx) g_SymLoadModuleEx = nullptr;
-static decltype(&SymFromName)     g_SymFromName = nullptr;
-static decltype(&SymSetOptions)   g_SymSetOptions = nullptr;
-static std::once_flag             g_dbg_once;
-static bool                       g_dbg_ok = false;
+}  // close anonymous namespace so resolve_symbol gets external linkage
+   // and can be called from agent_pattern_registry.cpp.
 
-}  // close anonymous namespace so init_dbghelp + resolve_symbol get
-   // external linkage and can be called from agent_pattern_registry.cpp.
-   // Anonymous-namespace statics above remain visible to them via the
-   // enclosing-namespace lookup rule.
-
+// init_dbghelp / g_dbg_ok kept as no-op stubs for callers that haven't
+// been migrated yet. v1.0.2 removed the PDB resolution path entirely
+// — it required dbghelp.dll + a .pdb sidecar file and went through
+// HotSpot's symbol table, which is one level above the project's
+// "vmStructs + memory walking" surface. Symbol resolution now goes
+// through PE export table (GetProcAddress on jvm.dll) for exported
+// names, then dynamic_xref_resolve for internal HotSpot functions
+// addressable via structural xref from exports, then user-registered
+// byte patterns as a manual override.
 void init_dbghelp() {
-    std::call_once(g_dbg_once, []{
-        g_dbg_h = LoadLibraryA("dbghelp.dll");
-        if (!g_dbg_h) return;
-        g_SymInitialize   = (decltype(&SymInitialize))   GetProcAddress(g_dbg_h, "SymInitialize");
-        g_SymLoadModuleEx = (decltype(&SymLoadModuleEx)) GetProcAddress(g_dbg_h, "SymLoadModuleEx");
-        g_SymFromName     = (decltype(&SymFromName))     GetProcAddress(g_dbg_h, "SymFromName");
-        g_SymSetOptions   = (decltype(&SymSetOptions))   GetProcAddress(g_dbg_h, "SymSetOptions");
-        if (!g_SymInitialize || !g_SymLoadModuleEx || !g_SymFromName) return;
-        g_SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
-        if (!g_SymInitialize(GetCurrentProcess(), nullptr, FALSE)) return;
-        // Find jvm.dll and load its PDB.
-        HMODULE jvm = GetModuleHandleA("jvm.dll");
-        if (!jvm) return;
-        char path[MAX_PATH] = {};
-        if (!GetModuleFileNameA(jvm, path, sizeof(path))) return;
-        MODULEINFO mi{};
-        if (!GetModuleInformation(GetCurrentProcess(), jvm, &mi, sizeof(mi))) return;
-        if (!g_SymLoadModuleEx(GetCurrentProcess(), nullptr, path, nullptr,
-                                (DWORD64)mi.lpBaseOfDll, mi.SizeOfImage, nullptr, 0))
-            return;
-        g_dbg_ok = true;
-    });
+    /* no-op since v1.0.2 — PDB tier removed */
 }
 
 uint64_t resolve_symbol(const char* name) {
-    // Try DbgHelp/PDB first — gives the most precise answer when available
-    // and works for both exported and internal HotSpot symbols.
-    if (g_dbg_ok) {
-        char buf[sizeof(SYMBOL_INFO) + MAX_SYM_NAME];
-        auto* info = reinterpret_cast<SYMBOL_INFO*>(buf);
-        std::memset(info, 0, sizeof(SYMBOL_INFO));
-        info->SizeOfStruct = sizeof(SYMBOL_INFO);
-        info->MaxNameLen   = MAX_SYM_NAME;
-        if (g_SymFromName(GetCurrentProcess(), name, info) && info->Address)
-            return info->Address;
-    }
-    // Fallback A: GetProcAddress on jvm.dll. Catches exported symbols
-    // (JVM_DefineClass, JNI_GetCreatedJavaVMs, ...) which DON'T need PDB.
-    // Mangling-free names only — won't match `JavaCalls::call` etc.
+    // Primary: PE export table on jvm.dll. Catches every exported
+    // symbol (JNI invocation API, JVM_GC, JVM_DefineClass when present,
+    // etc.) without any debug info. Mangling-free names only.
     if (HMODULE jvm = GetModuleHandleA("jvm.dll")) {
         if (auto p = GetProcAddress(jvm, name))
             return reinterpret_cast<uint64_t>(p);
     }
-    // Fallback B: dynamic xref resolver — walks exported functions and
+    // Fallback A: dynamic xref resolver — walks exported functions and
     // pulls internal targets out of CALL/RIP-rel sites. Works without
-    // any PDB or pre-supplied patterns. See agent_xref_resolvers.cpp.
+    // any debug info. See agent_xref_resolvers.cpp.
     if (uint64_t v = dynamic_xref_resolve(name)) return v;
-    // Fallback C: user-registered byte patterns. Last-resort; covers
-    // anything xref heuristics can't reach yet.
+    // Fallback B: user-registered byte patterns. Last-resort; covers
+    // internal symbols that xref heuristics can't reach yet.
     return pattern_registry_resolve(name);
 }
 
@@ -436,58 +400,18 @@ bool resolve_all() {
     std::lock_guard<std::mutex> lk(g_sym.mu);
     if (g_sym.ready) return true;
     if (g_sym.bootstrap_failed) return false;
-    init_dbghelp();
 
-    // Step 1: PDB-based resolution (no-op if g_dbg_ok=false; lookups
-    // return 0 if PDB isn't loaded).
+    // Step 1: PE-export resolution. Catches symbols that jvm.dll
+    // exports unconditionally (main_vm via xref, JNI invocation API,
+    // a handful of debug-friendly entry points). Internal HotSpot
+    // symbols like `JavaCalls::call` are NOT exported and require
+    // step 2 (xref-driven structural matching).
     g_sym.attach_current_thread = (void*)resolve_symbol("attach_current_thread");
     g_sym.javathread_current    = (void*)resolve_symbol("JavaThread::current");
     g_sym.javacalls_call        = (void*)resolve_symbol("JavaCalls::call");
     g_sym.javacallargs_ctor     = (void*)resolve_symbol("JavaCallArguments::JavaCallArguments");
     g_sym.main_vm_addr          = resolve_symbol("main_vm");
-    // Optional — needed only for object-arg passing. Two overloads exist:
-    //   make_local(JavaThread*, oop, [AllocFailType])  — 2-arg
-    //   make_local(oop)                                — 1-arg shim
-    // We need the 2-arg form. Detect by reading prologue bytes:
-    //   2-arg starts with `48 85 d2` (test rdx, rdx) — checks the oop param
-    //   1-arg starts with `48 89 5c 24 08 57 48 83 ec 20` (push rbx; sub rsp)
-    // Enumerate both, then pick the one whose prologue tests rdx.
-    {
-        char mask[] = "JNIHandles::make_local";
-        struct EnumState {
-            uint64_t addrs[4];
-            int      n;
-        } st{};
-        auto cb = [](SYMBOL_INFO* info, ULONG, PVOID userctx) -> BOOL {
-            auto* s = static_cast<EnumState*>(userctx);
-            if (s->n < 4) s->addrs[s->n++] = info->Address;
-            return TRUE;
-        };
-        HMODULE jvm = GetModuleHandleA("jvm.dll");
-        if (jvm) {
-            MODULEINFO mi{};
-            if (GetModuleInformation(GetCurrentProcess(), jvm, &mi, sizeof(mi))) {
-                decltype(&SymEnumSymbols) g_enum =
-                    (decltype(&SymEnumSymbols))GetProcAddress(g_dbg_h, "SymEnumSymbols");
-                if (g_enum) {
-                    g_enum(GetCurrentProcess(),
-                           (DWORD64)mi.lpBaseOfDll,
-                           mask, cb, &st);
-                }
-            }
-        }
-        for (int i = 0; i < st.n; ++i) {
-            const uint8_t* p = reinterpret_cast<const uint8_t*>(st.addrs[i]);
-            // Prologue test rdx, rdx  ==  48 85 D2
-            if (p[0] == 0x48 && p[1] == 0x85 && p[2] == 0xD2) {
-                g_sym.jnihandles_make_local = (void*)st.addrs[i];
-                break;
-            }
-        }
-        if (!g_sym.jnihandles_make_local) {
-            g_sym.jnihandles_make_local = (void*)resolve_symbol("JNIHandles::make_local");
-        }
-    }
+    g_sym.jnihandles_make_local = (void*)resolve_symbol("JNIHandles::make_local");
 
     // Step 2: xref-based bootstrap for anything still missing. Performs
     // an attach call inside, so it both resolves symbols AND prepares the
@@ -888,22 +812,20 @@ duk_ret_t js_invokeJC(duk_context* ctx) {
 // Marrow._defineClassNative(nameStr|null, bytesArray, loaderOopHex|null)
 //   -> Class oop hex string (or null on failure).
 //
-// Calls HotSpot's JVM_DefineClass directly when PDB resolution
-// succeeds; otherwise falls back to JNIEnv->DefineClass (vtable slot
-// 5) which is exposed unconditionally on every JDK and JRE. The
-// JNIEnv signature has one fewer arg (no protection_domain) but the
-// effect is the same — both paths register the resulting class with
-// SystemDictionary so subsequent Class.forName(name) can find it.
-//
-// This closes the JDK 21+ Class.forName injection gap that v0.5
-// documented as blocked by SystemDictionary not being data-driven via
-// vmStructs: defineClass via JNIEnv bypasses the SysDict-walking
-// path entirely, letting the user inject classes reachable through
-// canonical JLS lookup on every JDK.
+// Resolves HotSpot's `JVM_DefineClass` dynamically: it's exported from
+// jvm.dll, so `resolve_symbol` finds it via `GetProcAddress` without
+// any PDB / DbgHelp dependency. The agent gets a JNIEnv* through the
+// JNI Invocation API (`JavaVM->GetEnv` slot 6) — the Invocation API
+// is the bootstrap contract for JVM embedders and is NOT the JNI
+// Function API surface (FindClass / Call*Method) that v1.0.1's
+// honesty pass flagged. Calling JVM_DefineClass directly bypasses
+// JNI's vtable-dispatched DefineClass while still going through
+// HotSpot's blessed class-loading path (parsing, verification,
+// SystemDictionary registration), so subsequent Class.forName(name)
+// finds the class on every JDK.
 //
 // Returns the wide oop of the resulting Class<?> mirror, or null on
-// failure (parse error, name collision, OOM).
-// SEH-protected helpers (MSVC bans __try in functions with C++ destructors).
+// failure (parse error, name collision, OOM, symbol not exported).
 typedef void* (*DefineClassFn)(void* env, const char* name, void* loader,
                                 const int8_t* buf, int len, void* pd);
 __declspec(noinline)
@@ -938,7 +860,6 @@ duk_ret_t js_defineClassNative(duk_context* ctx) {
     const char* loader_hex = nullptr;
     if (duk_is_string(ctx, 2)) loader_hex = duk_get_string(ctx, 2);
 
-    init_dbghelp();
     if (!ensure_attached()) { duk_push_null(ctx); return 1; }
     if (!resolve_all()) { duk_push_null(ctx); return 1; }
 
@@ -973,25 +894,12 @@ duk_ret_t js_defineClassNative(duk_context* ctx) {
         }
     }
 
-    void* jclass_handle = nullptr;
-
-    // PDB-resolved JVM_DefineClass. v0.7 Stage D had also a JNIEnv
-    // vtable fallback (slot 5 DefineClass) — that path was removed
-    // because it violates the project's "no JNI" principle. The PDB
-    // path itself is still present for users who explicitly opt in
-    // via dev JDK, but it's NOT principle-aligned either: it requires
-    // dbghelp + .pdb and goes through JVM_DefineClass which crosses
-    // into the JNI invocation API surface. Class.forName injection on
-    // JDK 21+ stays formally blocked pending a deeper Metaspace+
-    // SystemDictionary path with empirical offset detection (analogous
-    // to _compiler_flags gap heuristic). Tracked future work.
-    uint64_t jvm_define_va = g_dbg_ok ? resolve_symbol("JVM_DefineClass") : 0;
-    if (jvm_define_va) {
-        auto define_fn = reinterpret_cast<DefineClassFn>(jvm_define_va);
-        jclass_handle = call_define_class_seh(
-            define_fn, env, name, loader_jobject, buf.data(), int(n));
-    }
-
+    // JVM_DefineClass via PE export resolution (no PDB, no DbgHelp).
+    uint64_t jvm_define_va = resolve_symbol("JVM_DefineClass");
+    if (!jvm_define_va) { duk_push_null(ctx); return 1; }
+    auto define_fn = reinterpret_cast<DefineClassFn>(jvm_define_va);
+    void* jclass_handle = call_define_class_seh(
+        define_fn, env, name, loader_jobject, buf.data(), int(n));
     if (!jclass_handle) { duk_push_null(ctx); return 1; }
 
     // jclass is a JNI local handle — pointer to a slot containing the oop.
@@ -1006,21 +914,22 @@ duk_ret_t js_defineClassNative(duk_context* ctx) {
 }
 
 // Marrow._initializeKlass(klassObj) -> bool
-// Drives HotSpot's InstanceKlass::initialize(this, JavaThread*) on the
-// given klass via the resolved symbols. Forces link_class + <clinit> to
-// run, populating Method::_i2i_entry on every method so subsequent
-// JavaCalls dispatch can route through them. Used by Java.openClassFile
-// after defineClass since defineClass does not link.
+// Drives HotSpot's `InstanceKlass::initialize(this, JavaThread*)` to
+// force link_class + <clinit>, populating Method::_i2i_entry on every
+// method so subsequent JavaCalls dispatch can route through them.
+// Used by Java.openClassFile after defineClass since defineClass
+// does not link.
+//
+// `InstanceKlass::initialize` and `JavaThread::current` are NOT
+// exported, but the dynamic xref resolver (agent_xref_resolvers.cpp)
+// finds them by structural matching against exported caller sites
+// — no PDB needed.
 duk_ret_t js_initializeKlass(duk_context* ctx) {
     uint64_t klass = obj_addr(ctx, 0);
     if (!klass) { duk_push_false(ctx); return 1; }
 
-    init_dbghelp();
-    if (!g_dbg_ok) { duk_push_false(ctx); return 1; }
-
-    // Re-resolve each call — DbgHelp state can drift across other PDB
-    // queries from sibling agent modules; cheap enough since SymFromName
-    // hits the loaded module's symbol map directly.
+    // Both symbols xref-resolved (no PDB) — see agent_xref_resolvers.cpp
+    // for the structural matchers.
     uint64_t init_va  = resolve_symbol("InstanceKlass::initialize");
     uint64_t jtcur_va = resolve_symbol("JavaThread::current");
     if (!init_va || !jtcur_va) { duk_push_false(ctx); return 1; }
@@ -1436,28 +1345,9 @@ duk_ret_t js_dbgReset(duk_context* ctx) {
     return 1;
 }
 
-// Diagnostic: try wrapping an oop via JNIEnv->NewLocalRef. Returns the
-// jobject hex or an error string. Used to isolate JNI crashes from the
-// rest of the invokeJNI path.
-duk_ret_t js_diagJniNewLocal(duk_context* ctx) {
-    const char* hex = duk_require_string(ctx, 0);
-    uint64_t oop = std::strtoull(
-        hex[0]=='0' && (hex[1]=='x'||hex[1]=='X') ? hex+2 : hex, nullptr, 16);
-    if (!resolve_all())     { duk_push_string(ctx, "no_pdb"); return 1; }
-    if (!ensure_attached()) { duk_push_string(ctx, "attach_failed"); return 1; }
-    void* env = current_jnienv();
-    if (!env) { duk_push_string(ctx, "no_env"); return 1; }
-    void** vtable = seh_read_vtable(env);
-    if (!vtable) { duk_push_string(ctx, "no_vtable"); return 1; }
-    void* new_local = *reinterpret_cast<void**>(
-        reinterpret_cast<char*>(vtable) + JNI_NewLocalRef);
-    void* lref = seh_jni_new_local(new_local, env, reinterpret_cast<void*>(oop));
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "0x%llx",
-                  (unsigned long long)reinterpret_cast<uintptr_t>(lref));
-    duk_push_string(ctx, buf);
-    return 1;
-}
+// _diagJniNewLocal removed v1.0.2 — was a diagnostic that actively
+// invoked JNIEnv->NewLocalRef. Pure JNI Function API surface, not
+// load-bearing for any user-facing feature.
 
 // Diagnostic: probe what decode_oop does with a candidate narrow value.
 duk_ret_t js_diagOopDecode(duk_context* ctx) {
@@ -1849,8 +1739,6 @@ void register_javacall_bindings(void* duk_ctx, int ns_idx) {
     duk_put_prop_string(ctx, ns_idx, "_diagMirror");
     duk_push_c_function(ctx, js_diagOopDecode, 1);
     duk_put_prop_string(ctx, ns_idx, "_diagOopDecode");
-    duk_push_c_function(ctx, js_diagJniNewLocal, 1);
-    duk_put_prop_string(ctx, ns_idx, "_diagJniNewLocal");
     duk_push_c_function(ctx, js_setReentryGuard, 2);
     duk_put_prop_string(ctx, ns_idx, "_setReentryGuard");
     duk_push_c_function(ctx, js_dbgFireTotal, 0);

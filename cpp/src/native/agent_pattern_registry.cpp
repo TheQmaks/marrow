@@ -32,12 +32,9 @@
 
 namespace marrow {
 
-// External: forward decl of DbgHelp init from agent_javacall.cpp. Reused so
-// we don't initialise SymInitialize twice.
-extern void init_dbghelp();
-extern uint64_t resolve_symbol(const char* name);   // PDB-only; we add
-                                                    // the registry fallback
-                                                    // below as a separate fn.
+extern uint64_t resolve_symbol(const char* name);   // PE export +
+                                                    // xref + this
+                                                    // registry fallback.
 
 namespace {
 
@@ -221,10 +218,10 @@ static duk_ret_t js_list_patterns(duk_context* c) {
     return 1;
 }
 
-// JS: Marrow._resolveSymbol(name) → hex VA | null. Tries PDB then registry.
+// JS: Marrow._resolveSymbol(name) → hex VA | null. Walks the PDB-less
+// resolution chain (PE export, xref, byte-pattern registry).
 static duk_ret_t js_resolve_symbol(duk_context* c) {
     const char* name = duk_require_string(c, 0);
-    init_dbghelp();
     uint64_t va = resolve_symbol(name);
     if (!va) va = pattern_registry_resolve(name);
     if (!va) { duk_push_null(c); return 1; }
@@ -235,13 +232,13 @@ static duk_ret_t js_resolve_symbol(duk_context* c) {
 }
 
 // JS: Marrow._extractRawBytes(name, len) → hex string | null.
-// Resolves `name` via PDB and reads the first `len` bytes (1..256). Used
-// from a debug-image machine to author patterns that other machines load.
+// Resolves `name` (PE export / xref / pattern) and reads the first
+// `len` bytes (1..256). Used to author patterns that other machines
+// load — pattern-registry round-trip helper.
 static duk_ret_t js_extract_raw_bytes(duk_context* c) {
     const char* name = duk_require_string(c, 0);
     int len = duk_get_int_default(c, 1, 32);
     if (len < 1 || len > 256) len = 32;
-    init_dbghelp();
     uint64_t va = resolve_symbol(name);
     if (!va) { duk_push_null(c); return 1; }
     std::string out;

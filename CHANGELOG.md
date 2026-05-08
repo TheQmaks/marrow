@@ -6,6 +6,92 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.2] — 2026-05-08
+
+PDB removal + minor JNI surface cleanup.
+
+### PDB / DbgHelp resolution tier removed
+
+`resolve_symbol` previously chained PDB → GetProcAddress → xref →
+patterns. PDB requires `dbghelp.dll` + a `.pdb` sidecar — explicitly
+out of scope per the project's "vmStructs + memory walking only"
+principle. Now: PE export → xref → patterns. Every internal HotSpot
+symbol Marrow needs (`JavaCalls::call`, `JNIHandles::make_local`,
+`InstanceKlass::initialize`, `attach_current_thread`,
+`JavaThread::current`, `main_vm`, `JavaCallArguments::JavaCallArguments`)
+resolves through the structural xref walker without any debug info.
+Stage D's `JVM_DefineClass` is exported from `jvm.dll`, so PE export
+finds it directly — no PDB needed for that either.
+
+`Marrow.pdbSymbolAt` / `Marrow.pdbSymbolsLike` removed. They were
+diagnostic helpers for users running on a debug image with `.pdb`
+installed — no pure-memory equivalent exists, so they're gone
+without replacement.
+
+`agent_pdbsym.cpp` deleted. `init_dbghelp()` kept as a no-op stub
+for callers that haven't been migrated yet (will be removed in a
+future minor). `g_dbg_ok` references removed from `js_javaCallStatus`,
+`js_initializeKlass`, `js_defineClassNative` — they all just call
+`resolve_symbol` directly now.
+
+### `_initializeKlass` and `_defineClassNative` work PDB-less
+
+Both were previously gated on `g_dbg_ok`. Now route through
+`resolve_symbol` which finds:
+- `JVM_DefineClass`: PE export on jvm.dll
+- `InstanceKlass::initialize`: xref structural matcher
+- `JavaThread::current`: xref / TLS shim
+
+Class injection workflow (defineClass + initializeKlass +
+Class.forName) is functional on every JDK without any debug info,
+just by walking the binary's own metadata.
+
+### `_diagJniNewLocal` removed
+
+Diagnostic that actively invoked `JNIEnv->NewLocalRef` (JNI Function
+API). Not load-bearing for any user-facing feature; gone.
+
+### Documentation honesty
+
+README's "what's not used" section now lists explicitly:
+
+- No JVMTI ✓
+- No `-agentpath` / JDWP / Attach API ✓
+- No PDB / DbgHelp ✓ (new)
+
+And what IS used as documented compromise:
+- JNI Function API: `_invokeJNI` for primitive-arg static dispatch
+  on JDK 8/11, `JNIEnv->ExceptionCheck` for JC pending-exception
+  detection. Both tracked future work.
+- JNI Invocation API (`JavaVM->GetEnv`) for bootstrap — that's the
+  embedder contract every JVM client uses, distinct from the
+  Function API surface being phased out.
+
+### Cross-JDK regression
+
+agent_smoke 24/24 PASS × JDK 8 / 11 / 17 / 21 / 25 ✅
+verify_stress[1-5] 69/69 PASS × JDK 8 / 11 / 17 / 21 / 25 ✅
+
+### Files
+
+- Deleted: `cpp/src/native/agent_pdbsym.cpp`
+- `cpp/CMakeLists.txt`: dropped `agent_pdbsym.cpp` from sources
+- `cpp/include/agent_modules.hpp`: removed `register_pdbsym_bindings` decl
+- `cpp/src/script/agent_js.cpp`: removed `register_pdbsym_bindings` call
+- `cpp/src/native/agent_pattern_registry.cpp`: dropped `init_dbghelp()`
+  references in `_resolveSymbol` / `_extractRawBytes` (PDB path gone)
+- `cpp/src/script/agent_javacall.cpp`:
+  - `g_dbg_ok` removed from `resolve_all` / `js_javaCallStatus` /
+    `js_initializeKlass` / `js_defineClassNative`
+  - PDB tier in `resolve_symbol` removed
+  - `js_diagJniNewLocal` removed + binding unregistered
+  - DbgHelp dispatch table state (`g_dbg_h`, `g_SymInitialize`, ...)
+    removed
+  - PDB-based `JNIHandles::make_local` overload disambiguation
+    removed (xref resolver handles overload selection structurally)
+- `pyproject.toml`: 1.0.1 → 1.0.2
+- `README.md`: status updated, principle explicitly listed
+
 ## [1.0.1] — 2026-05-08
 
 Honesty audit. v1.0 shipped two principle compromises that deserved

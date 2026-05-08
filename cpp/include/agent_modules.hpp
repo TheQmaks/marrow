@@ -66,7 +66,6 @@ void register_redefine_bindings(void* duk_ctx, int ns_idx);
 void register_writemem_bindings(void* duk_ctx, int ns_idx);
 void register_methsym_bindings(void* duk_ctx, int ns_idx);
 void register_memprotect_bindings(void* duk_ctx, int ns_idx);
-void register_pdbsym_bindings(void* duk_ctx, int ns_idx);
 void register_javacall_bindings(void* duk_ctx, int ns_idx);
 void register_pattern_bindings(void* duk_ctx, int ns_idx);
 void register_pattern_registry_bindings(void* duk_ctx, int ns_idx);

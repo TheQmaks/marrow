@@ -1790,7 +1790,6 @@ void install_bindings(duk_context* ctx) {
     register_writemem_bindings(ctx, ns);
     register_methsym_bindings(ctx, ns);
     register_memprotect_bindings(ctx, ns);
-    register_pdbsym_bindings(ctx, ns);
     register_javacall_bindings(ctx, ns);
     register_pattern_bindings(ctx, ns);
     register_pattern_registry_bindings(ctx, ns);

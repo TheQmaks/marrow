@@ -124,7 +124,6 @@ add_library(marrow_agent SHARED
     src/native/agent_sysinfo.cpp
     src/native/agent_watch.cpp
     src/native/agent_hwwatch_ext.cpp
-    src/native/agent_pdbsym.cpp
     src/native/agent_pattern.cpp
     src/native/agent_pattern_registry.cpp
     src/native/agent_xref.cpp

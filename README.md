@@ -7,37 +7,41 @@ hook methods, replace return values, watch variables with hardware breakpoints,
 clone classes — all from JS scripts you push live into a running JVM.
 
 **No JVMTI. No `-agentpath`. No `-XX:+UnlockDiagnosticVMOptions`. No
-JDWP. No Attach API.**
+JDWP. No Attach API. No PDB / DbgHelp.**
 
-Marrow drives HotSpot the way HotSpot's own Serviceability Agent does:
-by reading the exported `gHotSpotVMTypes` / `gHotSpotVMStructEntries`
-arrays at runtime and walking memory directly. Every field offset,
-every method entry, every Klass layout is resolved from the JVM you
-have, not from a baked-in table. That's how a single binary works on
-JDK 8 through JDK 25.
+Marrow drives HotSpot the way HotSpot's own Serviceability Agent
+does: by reading the exported `gHotSpotVMTypes` /
+`gHotSpotVMStructEntries` arrays at runtime and walking memory
+directly. Every field offset, every method entry, every Klass
+layout is resolved from the JVM you have, not from a baked-in
+table. Internal HotSpot symbols like `JavaCalls::call`,
+`JNIHandles::make_local`, `InstanceKlass::initialize` resolve
+through a structural xref walker (PE export table + RIP-relative
+call-site analysis) — no `.pdb` sidecar, no debug info. That's
+how a single binary works on JDK 8 through JDK 25.
 
 The primary surface — method hooking, field reads, heap walking,
-class enumeration, hardware-breakpoint watches — is pure memory +
-vmStructs, no JNI at all.
+class enumeration, hardware-breakpoint watches, class injection
+via `JVM_DefineClass` (PE-exported, no PDB) — is pure memory +
+vmStructs, no JNI Function API.
 
-Java method *invocation* from JS (driving `Java.use(...).method(args)`
-calls) is a different story and a documented compromise:
+Java method *invocation* from JS is a documented compromise:
 
 - Object-arg dispatch goes through `_invokeJC` — a bridge to HotSpot's
-  internal `JavaCalls::call`, address resolved at runtime via xref
-  (no PDB symbol resolution).
+  internal `JavaCalls::call`, address resolved at runtime via xref.
 - Primitive-arg static dispatch on JDK 8 / 11 still routes through
-  `_invokeJNI`, which talks to the JNIEnv vtable (`FindClass` +
-  `GetStaticMethodID` + `CallStatic*MethodA`). The deeper JC path
-  has a per-JDK `JavaCallArguments` layout issue that's been deferred
-  pending RE work.
+  `_invokeJNI`, which talks to the JNIEnv vtable. The deeper JC
+  path has a per-JDK `JavaCallArguments` layout issue that's
+  deferred pending RE work.
 - The JC exception check uses `JNIEnv->ExceptionCheck` because
   vmStructs doesn't expose `Thread::_pending_exception` on JDK 17+.
   Replacement via an empirical Thread-layout walker (analogous to
   the `_compiler_flags` gap heuristic) is tracked future work.
 
-These JNI compromises are isolated to the *invocation* helpers and
-do not exist in the hooking, field-access, or heap-walking surfaces.
+The bootstrap relies on the JNI Invocation API (`JavaVM->GetEnv`)
+to obtain a `JNIEnv*` for class definition and exception polling —
+that's the embedder contract every JVM client uses, distinct from
+the JNI Function API surface that's gradually being removed.
 
 ---
 
@@ -47,13 +51,14 @@ do not exist in the hooking, field-access, or heap-walking surfaces.
 - **Compatibility.** HotSpot JDK 8, 11, 17, 21, 25 — both JDK and JRE
   distributions, on every supported GC (G1, Parallel, Serial,
   Shenandoah, ZGC).
-- **Maturity.** v1.0.1 — every test suite passes strict mode on every
+- **Maturity.** v1.0.2 — every test suite passes strict mode on every
   supported runtime. APIs are committed under semver; breaking
-  changes trigger a major bump. v1.0.1 rolled back the v1.0 Stage D
-  JNIEnv->DefineClass shortcut (Class.forName injection on JDK 21+)
-  because both the JNI fallback AND the PDB-resolved path violated
-  the project's "go below public APIs" principle. Class.forName
-  injection is back to "blocked, future work" status.
+  changes trigger a major bump. v1.0.2 ripped out the PDB / DbgHelp
+  resolution tier entirely and replaced it with PE-export +
+  structural xref walking. `Marrow.pdbSymbolAt` /
+  `Marrow.pdbSymbolsLike` removed (no replacement available — they
+  were diagnostic helpers for debug-image users). `_diagJniNewLocal`
+  removed (it was a JNI Function API diagnostic, not load-bearing).
 
 ---
 
