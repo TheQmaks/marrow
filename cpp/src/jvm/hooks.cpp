@@ -217,9 +217,12 @@ void MethodHook::uninstall() {
     r->free(counter_addr);
 }
 
-// Simple callback trampoline: saves volatile regs + flags, aligns stack,
-// calls cb(ctx). Register snapshot deferred to a future revision — this
-// version is the proven-working one from earlier sessions.
+// Simple callback trampoline (used by install_counting_hook for hooks
+// that only need a fire counter, no GPR/stack snapshot). Saves
+// volatile regs + flags, aligns stack, calls cb(ctx). For full GPR
+// snapshot + skip_orig support, see install_callback_hook_full /
+// emit_full_trampoline below — that variant is what the JS
+// .implementation/.attach surface drives.
 
 // Trampoline asm bytes. Saves regs into a stack frame, computes original
 // RSP, calls hook_dispatch(ctx, saved_ptr=rsp_after_pushes, cb), then

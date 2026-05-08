@@ -6,13 +6,38 @@ A Frida-equivalent dynamic instrumentation toolkit for HotSpot. Read fields,
 hook methods, replace return values, watch variables with hardware breakpoints,
 clone classes — all from JS scripts you push live into a running JVM.
 
-**No JNI. No JVMTI. No `-agentpath`. No `-XX:+UnlockDiagnosticVMOptions`.**
+**No JVMTI. No `-agentpath`. No `-XX:+UnlockDiagnosticVMOptions`. No
+JDWP. No Attach API.**
 
-Marrow drives HotSpot the way HotSpot's own Serviceability Agent does: by
-reading the exported `gHotSpotVMTypes` / `gHotSpotVMStructEntries` arrays at
-runtime and walking memory directly. Every field offset, every method entry,
-every Klass layout is resolved from the JVM you have, not from a baked-in
-table. That's how a single binary works on JDK 8 through JDK 25.
+Marrow drives HotSpot the way HotSpot's own Serviceability Agent does:
+by reading the exported `gHotSpotVMTypes` / `gHotSpotVMStructEntries`
+arrays at runtime and walking memory directly. Every field offset,
+every method entry, every Klass layout is resolved from the JVM you
+have, not from a baked-in table. That's how a single binary works on
+JDK 8 through JDK 25.
+
+The primary surface — method hooking, field reads, heap walking,
+class enumeration, hardware-breakpoint watches — is pure memory +
+vmStructs, no JNI at all.
+
+Java method *invocation* from JS (driving `Java.use(...).method(args)`
+calls) is a different story and a documented compromise:
+
+- Object-arg dispatch goes through `_invokeJC` — a bridge to HotSpot's
+  internal `JavaCalls::call`, address resolved at runtime via xref
+  (no PDB symbol resolution).
+- Primitive-arg static dispatch on JDK 8 / 11 still routes through
+  `_invokeJNI`, which talks to the JNIEnv vtable (`FindClass` +
+  `GetStaticMethodID` + `CallStatic*MethodA`). The deeper JC path
+  has a per-JDK `JavaCallArguments` layout issue that's been deferred
+  pending RE work.
+- The JC exception check uses `JNIEnv->ExceptionCheck` because
+  vmStructs doesn't expose `Thread::_pending_exception` on JDK 17+.
+  Replacement via an empirical Thread-layout walker (analogous to
+  the `_compiler_flags` gap heuristic) is tracked future work.
+
+These JNI compromises are isolated to the *invocation* helpers and
+do not exist in the hooking, field-access, or heap-walking surfaces.
 
 ---
 
@@ -22,10 +47,13 @@ table. That's how a single binary works on JDK 8 through JDK 25.
 - **Compatibility.** HotSpot JDK 8, 11, 17, 21, 25 — both JDK and JRE
   distributions, on every supported GC (G1, Parallel, Serial,
   Shenandoah, ZGC).
-- **Maturity.** v0.5.0 — every test suite passes strict mode on every
-  supported runtime. **60/60 (test-suite × runtime) configurations
-  green** as of release. APIs are settling; breaking changes from here
-  on get a clear changelog entry.
+- **Maturity.** v1.0.1 — every test suite passes strict mode on every
+  supported runtime. APIs are committed under semver; breaking
+  changes trigger a major bump. v1.0.1 rolled back the v1.0 Stage D
+  JNIEnv->DefineClass shortcut (Class.forName injection on JDK 21+)
+  because both the JNI fallback AND the PDB-resolved path violated
+  the project's "go below public APIs" principle. Class.forName
+  injection is back to "blocked, future work" status.
 
 ---
 
@@ -55,7 +83,7 @@ HotSpot natively:
 
 |                            | Frida                       | Marrow                                    |
 |----------------------------|-----------------------------|-------------------------------------------|
-| Java method hooks          | through Java.use() (via JNI) | direct: patch `Method::_i2i_entry`        |
+| Java method hooks          | through Java.use() (via JNI) | direct: patch `Method::_from_interpreted_entry` |
 | Field reads/writes         | via JNI                     | vmStructs offset + raw memory             |
 | Hardware field watch       | no                          | yes — DR0–DR3 watchpoints                 |
 | Heap class histogram       | no                          | yes — walks GC regions                    |
@@ -157,19 +185,22 @@ JS: T.tick.implementation = fn
         │
         ▼
   ┌─────────────────────────────────────────────┐
-  │ Agent allocates 108-byte trampoline in RWX  │
-  │   - saves all GPRs + xmm0..3                │
+  │ Agent allocates 132-byte trampoline in RWX  │
+  │   - saves all GPRs + rflags                 │
   │   - copies arg slots from native stack      │
   │   - calls the agent thread with snapshot    │
-  │   - if handler returned a value:            │
-  │       loads RAX from snapshot.replace_rax   │
-  │       RETs to the caller                    │
-  │   - else jumps to original _i2i_entry       │
+  │   - dispatch returns uint64 = (skip<<63)    │
+  │     | replace_rax; trampoline reads rax     │
+  │     after pops, no shared-memory probe      │
+  │   - if skip bit set: RETs with masked rax   │
+  │   - else jumps to original                  │
+  │     `_from_interpreted_entry`               │
   └─────────────────────────────────────────────┘
         │
         ▼
-  Patches Method::_i2i_entry → trampoline
-  Patches nmethod::_verified_entry_point if JIT'd
+  Patches Method::_from_interpreted_entry → trampoline
+  Disables JIT for the method via Method::_access_flags
+  (or _compiler_flags on JDK 21+) so no nmethod is published
         │
         ▼
   Handler runs synchronously from the JVM thread,
@@ -214,8 +245,8 @@ No JVMTI, no Attach API, no per-JDK hardcoded offsets in source code.
 ## Cross-JDK matrix
 
 `tests/agent_smoke.py` covers every CLI/agent command on every supported
-JDK and GC combination. v0.5 also runs five stress suites strict mode
-across the full matrix (no flaky-test acceptance).
+JDK and GC combination. Five stress suites run strict mode across the
+full matrix (no flaky-test acceptance).
 
 | JDK | G1 | Parallel | Serial | Shenandoah | ZGC | wide oops |
 |-----|----|----------|--------|------------|-----|-----------|
@@ -225,7 +256,7 @@ across the full matrix (no flaky-test acceptance).
 | 21  | ✓  | ✓        | ✓      | ✓          | ✓ generational | ✓ |
 | 25  | ✓  | ✓        | ✓      | ✓          | ✓   | ✓ |
 
-**v0.5 strict-mode regression matrix.** Six test suites × ten runtimes
+**Strict-mode regression matrix.** Six test suites × ten runtimes
 (JDK 8/11/17/21/25 + JRE 8/11/17/21/25) = **60/60 PASS**:
 
 | Suite          | JDK 8/11/17/21/25 | JRE 8/11/17/21/25 |
@@ -321,8 +352,9 @@ from v1.0.0. The public surface that's guaranteed stable:
 - **JS Frida-compat API**: `Java.use`, `Java.cast`, `Java.choose`,
   `Java.invoke`, `Java.invokeStatic`, `Java.toString`, `Java.drain`,
   `.implementation = fn`, `.attach(fn)`, `.callOriginal`, `.setReturn`.
-- **JS Marrow primitives**: `Marrow.log`, `Marrow._defineClassNative`,
-  `Marrow._invokeJC`, `Marrow._invokeJNI` and their argument shapes.
+- **JS Marrow primitives**: `Marrow.log`, `Marrow._invokeJC`,
+  `Marrow._invokeJNI` (documented compromise — see top of README),
+  and their argument shapes.
 - **CLI**: `marrow.exe inject`, `marrow.exe agent <pid> eval <js>`,
   `marrow.exe dump`, `marrow.exe threads`, `marrow.exe classes`.
 - **Out-of-process Python API**: `VMMeta`, `Reader`, `ClassWalker`,
@@ -349,9 +381,17 @@ Breaking changes to the stable surface trigger a major version bump.
 - ZGC on Windows requires JDK 14+ (Temurin 11 doesn't ship it).
 - ZGC on JDK 21 requires `-XX:+ZGenerational` (legacy single-gen has no
   exported colour masks we can decode).
-- `Class.forName` reachability for cloned classes is blocked on JDK 21+
-  pending per-version offset RE — it's the one feature not yet
-  data-driven.
+- `Class.forName` reachability for injected classes is blocked across
+  every JDK in v2.0+. v1.0 shipped a `_defineClassNative` shortcut
+  that went through `JVM_DefineClass` (PDB-resolved) or
+  `JNIEnv->DefineClass` — both violated the project's "no JNI, no
+  PDB" principle. The deeper path (Metaspace allocation +
+  per-JDK SystemDictionary offset detection via empirical heuristic
+  similar to `_compiler_flags` gap detection) is tracked future work.
+- The JC exception-check helper still uses `JNIEnv->ExceptionCheck`
+  internally because vmStructs doesn't expose `Thread::_pending_exception`
+  on JDK 17+. Documented compromise; replacing it with an empirical
+  Thread-layout walker is tracked future work.
 - Stripped `jvm.dll` works for everything (we don't need PDBs).
   JRE-only distributions are fully supported as of v0.5 — the same
   test matrix passes strict on every JRE we ship against.

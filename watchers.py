@@ -1,13 +1,14 @@
 """Field watchers.
 
-Phase M6.a: polling watcher — periodically re-reads a field in the target
-process and fires a callback on value change. Zero impact on the target
-JVM; loses rapid transitions that alternate faster than the polling
+Polling watcher — periodically re-reads a field in the target process
+and fires a callback on value change. Zero impact on the target JVM;
+loses rapid transitions that alternate faster than the polling
 interval. Adequate for debugging, state dashboards, and tracing slow
 state machines.
 
-Phase M6.b (not yet): hardware-assisted watcher for static fields via
-VirtualProtectEx(PAGE_READONLY) + AddVectoredExceptionHandler.
+For zero-poll watching of static fields, see the in-process
+`Java.watchField` API which uses x64 hardware debug registers
+(DR0-DR3) — no SuspendThread, no overhead between fires.
 """
 from __future__ import annotations
 

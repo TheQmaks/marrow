@@ -906,10 +906,6 @@ duk_ret_t js_invokeJC(duk_context* ctx) {
 // SEH-protected helpers (MSVC bans __try in functions with C++ destructors).
 typedef void* (*DefineClassFn)(void* env, const char* name, void* loader,
                                 const int8_t* buf, int len, void* pd);
-// JNIEnv->DefineClass: jclass(*)(JNIEnv*, const char*, jobject, const jbyte*, jsize)
-typedef void* (*JniDefineClassFn)(void* env, const char* name, void* loader,
-                                    const int8_t* buf, int len);
-constexpr size_t JNI_DefineClass = 5 * 8;
 __declspec(noinline)
 static void* call_make_local_seh(JniMakeLocalFn fn, void* thread, void* oop) {
     __try { return fn(thread, oop); }
@@ -920,13 +916,6 @@ static void* call_define_class_seh(DefineClassFn fn, void* env,
                                     const char* name, void* loader,
                                     const int8_t* buf, int len) {
     __try { return fn(env, name, loader, buf, len, nullptr); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
-}
-__declspec(noinline)
-static void* call_jni_define_class_seh(JniDefineClassFn fn, void* env,
-                                        const char* name, void* loader,
-                                        const int8_t* buf, int len) {
-    __try { return fn(env, name, loader, buf, len); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
 
@@ -986,35 +975,21 @@ duk_ret_t js_defineClassNative(duk_context* ctx) {
 
     void* jclass_handle = nullptr;
 
-    // Path 1: PDB-resolved JVM_DefineClass (preferred when symbols are
-    // available — slightly cheaper, avoids one indirection).
+    // PDB-resolved JVM_DefineClass. v0.7 Stage D had also a JNIEnv
+    // vtable fallback (slot 5 DefineClass) — that path was removed
+    // because it violates the project's "no JNI" principle. The PDB
+    // path itself is still present for users who explicitly opt in
+    // via dev JDK, but it's NOT principle-aligned either: it requires
+    // dbghelp + .pdb and goes through JVM_DefineClass which crosses
+    // into the JNI invocation API surface. Class.forName injection on
+    // JDK 21+ stays formally blocked pending a deeper Metaspace+
+    // SystemDictionary path with empirical offset detection (analogous
+    // to _compiler_flags gap heuristic). Tracked future work.
     uint64_t jvm_define_va = g_dbg_ok ? resolve_symbol("JVM_DefineClass") : 0;
     if (jvm_define_va) {
         auto define_fn = reinterpret_cast<DefineClassFn>(jvm_define_va);
         jclass_handle = call_define_class_seh(
             define_fn, env, name, loader_jobject, buf.data(), int(n));
-    }
-
-    // Path 2: JNIEnv->DefineClass via vtable slot 5. PDB-less path used
-    // on stripped JREs and on JDK 21+ where JVM_DefineClass may not be
-    // exported. The JNI surface DefineClass also walks SystemDictionary
-    // registration — Class.forName(name) finds the class after either
-    // path returns.
-    if (!jclass_handle) {
-        void** vtable = seh_read_vtable(env);
-        if (vtable) {
-            auto get_slot = [&](size_t off) -> void* {
-                return *reinterpret_cast<void**>(
-                    reinterpret_cast<char*>(vtable) + off);
-            };
-            auto jni_define = reinterpret_cast<JniDefineClassFn>(
-                get_slot(JNI_DefineClass));
-            if (jni_define) {
-                jclass_handle = call_jni_define_class_seh(
-                    jni_define, env, name, loader_jobject,
-                    buf.data(), int(n));
-            }
-        }
     }
 
     if (!jclass_handle) { duk_push_null(ctx); return 1; }

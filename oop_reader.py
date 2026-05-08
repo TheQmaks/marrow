@@ -1,11 +1,10 @@
 """Oop / compressed-pointer decoder for HotSpot heap access.
 
-Phase M3.a: resolve compressed oop + compressed Klass parameters from VM
-globals, decode narrow pointers, deref OopHandle, and read an object's
-Klass pointer from its header.
-
-Phase M3.b (not yet): InstanceKlass::_fieldinfo_stream decoder + by-name
-instance field access + java.lang.String reader.
+Resolves compressed-oop + compressed-Klass parameters from VM globals,
+decodes narrow pointers, dereferences OopHandle, and reads an object's
+Klass pointer from its header. The companion `field_reader` module
+layers by-name instance-field access on top, and `string_reader`
+provides java.lang.String decoding.
 """
 from __future__ import annotations
 

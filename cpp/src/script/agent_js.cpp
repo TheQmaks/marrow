@@ -211,7 +211,9 @@ static uint64_t js_to_rax(duk_context* c, char ret_letter) {
 //     the stack snapshot. JS handler still gets all args, but mapping
 //     for stack-args requires `via=1` (compiled). For interpreter (`via=0`)
 //     args sit on the operand stack — we don't decode those here yet.
-//   - Object args passed to handler: not yet wrapped (handler sees raw oop hex).
+//   - Object args passed to the C++ side as raw oop hex; the JS-layer
+//     proxy in agent_bootstrap auto-casts via Java.cast (see examples
+//     11/12 for the multi-arg / nested-object decode pattern).
 static void invoke_handler_sync(JsImplEntry* e, HookContext* ctx) {
     if (!g_js_host) return;
     std::lock_guard<std::recursive_mutex> lock(g_js_host->mu());

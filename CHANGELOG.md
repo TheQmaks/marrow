@@ -6,6 +6,74 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-05-08
+
+Honesty audit. v1.0 shipped two principle compromises that deserved
+flagging, not celebrating:
+
+### Stage D rollback (Class.forName injection on JDK 21+)
+
+v0.7 Stage D added a `JNIEnv->DefineClass` vtable fallback to
+`_defineClassNative` so Class.forName injection would work without
+PDB symbols on JDK 21+. The fallback used JNI surface, which violates
+the project's "no JNI" principle — and the PDB-resolved
+`JVM_DefineClass` primary path also violates it (PDB resolution is
+explicitly out of scope).
+
+This release:
+- Removes the JNIEnv vtable fallback path from `js_defineClassNative`.
+- Removes `tests/verify_defineclass.py`.
+- Restores README's "Class.forName injection blocked on JDK 21+,
+  future work" claim.
+- The PDB-resolved path remains for users who explicitly opt in via
+  dev JDK + `.pdb` (it's narrowly useful), but is documented as a
+  compromise. Eventual replacement: empirical Metaspace +
+  SystemDictionary offset detection (analogous to `_compiler_flags`
+  gap heuristic from v0.5).
+
+### README honesty pass
+
+v1.0's "**No JNI.**" headline was overstated — Marrow has used
+`Marrow._invokeJNI` since v0.1 for primitive-arg static method
+dispatch, because the deeper `_invokeJC` (xref-resolved
+`JavaCalls::call`) path has a per-JDK `JavaCallArguments` layout
+issue that returns 0 for primitives on JDK 8/11. README now
+explicitly enumerates the JNI compromises (kept narrowly to
+invocation helpers) and clarifies that the *primary* surface —
+hooks, field reads, heap walking, hardware watches — is pure
+memory + vmStructs, no JNI.
+
+Trampoline size correction (108 → 132 bytes after v0.6 ASM
+rewrite), `_i2i_entry` → `_from_interpreted_entry` (modern field
+name), removed the false "+xmm0..3" claim, dropped `_defineClassNative`
+from the "stable API" surface list.
+
+### Internal docstring cleanup
+
+- `watchers.py` / `oop_reader.py` — dropped internal "Phase M3.a/M6.b"
+  task-tracking markers from public docstrings.
+- `cpp/src/jvm/hooks.cpp` — clarified the simple-trampoline comment
+  that mentioned "register snapshot deferred"; the full trampoline
+  variant has had GPR snapshot since v0.4.
+- `cpp/src/script/agent_js.cpp` — clarified the "object args not yet
+  wrapped" comment to point to the JS-side proxy that auto-casts.
+
+### What v1.0.1 did NOT change
+
+- `Marrow._invokeJNI` is still in the codebase. Removing it requires
+  fixing `_invokeJC` for JDK 8/11 primitive args (per-JDK
+  `JavaCallArguments` layout RE), which is a multi-day research task
+  and out of scope for a patch release. Tracked future work.
+- The JC exception check still uses `JNIEnv->ExceptionCheck`. Same
+  reason: replacement requires empirical
+  `Thread::_pending_exception` offset walker.
+
+### Cross-JDK regression
+
+agent_smoke 24/24 PASS × JDK 8 / 11 / 17 / 21 / 25 ✅. Other v1.0
+test invariants (verify_stress[1-5], verify_multithread,
+verify_example_14) preserved.
+
 ## [1.0.0] — 2026-05-07
 
 The closure release. Every architectural debt the project accumulated
