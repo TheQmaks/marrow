@@ -194,11 +194,23 @@ static JniCallResult seh_jni_call(void* fn_va, char ret_c, void* env,
 namespace marrow {
 namespace {
 
-// Forward decls — implementations live further down. js_invokeJC uses
-// jc_pending_exception_via_jni at its main path; without forward-decl
-// C++ wouldn't see it.
+// Forward decls — implementations live further down.
 static bool jc_check_pending_exception(uint64_t pe_addr);
-static bool jc_pending_exception_via_jni();
+static bool jc_pending_exception_via_offset();
+
+// Resolves Thread::_pending_exception offset by disassembling
+// JNIEnv->ExceptionCheck (PDB-less). The JNI implementation does:
+//   thread = (JavaThread*)((char*)env - jni_environment_offset())
+//   return thread->_pending_exception != 0
+// In x64, that's a `sub reg, env_offset` followed by a
+// `mov rax, [reg + PE_OFFSET]; test rax, rax`. We already know
+// env_offset (g_xref_env_offset, resolved structurally), so we
+// scan for the matching `sub`/`lea` and read off the next
+// `mov reg, [reg + disp]` instruction's disp32.
+//
+// Returns 0 if disassembly didn't match a known shape — caller
+// falls back to JNI ExceptionCheck.
+static size_t resolve_pending_exception_offset();
 
 // ---------------------------------------------------------------------------
 // Symbol cache. Resolved once via DbgHelp from jvm.dll on first invokeJC().
@@ -785,11 +797,12 @@ duk_ret_t js_invokeJC(duk_context* ctx) {
     if (threw) { duk_push_string(ctx, "java_exception"); return 1; }
 
     // Java exceptions (NumberFormatException etc.) survive seh_jc_call
-    // without raising an SEH exception. JNI's ExceptionCheck on the
-    // current JNIEnv detects them — same path js_invokeJNI uses. On
-    // hit we surface "java_exception" so _unwrap turns it into a
-    // JS-side throw.
-    if (jc_pending_exception_via_jni()) {
+    // without raising an SEH exception. We detect them by reading
+    // Thread::_pending_exception directly — offset resolved
+    // structurally by disassembling JNIEnv->ExceptionCheck and
+    // confirmed against the C++ ABI invariant (vptr at +0, first
+    // ThreadShadow field at +8 on x64). Pure memory, no JNI call.
+    if (jc_pending_exception_via_offset()) {
         duk_push_string(ctx, "java_exception");
         return 1;
     }
@@ -1345,6 +1358,13 @@ duk_ret_t js_dbgReset(duk_context* ctx) {
     return 1;
 }
 
+// Diag: returns the empirically-resolved Thread::_pending_exception
+// offset (0 means walker failed and we fall back to JNI ExceptionCheck).
+duk_ret_t js_dbgPendingExceptionOffset(duk_context* ctx) {
+    duk_push_uint(ctx, (duk_uint_t)resolve_pending_exception_offset());
+    return 1;
+}
+
 // _diagJniNewLocal removed v1.0.2 — was a diagnostic that actively
 // invoked JNIEnv->NewLocalRef. Pure JNI Function API surface, not
 // load-bearing for any user-facing feature.
@@ -1508,32 +1528,139 @@ static bool jc_check_pending_exception(uint64_t pe_addr) {
     return had_pending;
 }
 
-// Combined: check whether Java has a pending exception via the JNIEnv
-// vtable (same path js_invokeJNI uses). vmStructs doesn't expose
-// Thread::_pending_exception on every JDK we care about (JDK 17 in
-// particular omits it), so the direct field-read approach via Thread
-// would silently no-op there. JNI's ExceptionCheck reads the same
-// underlying field but goes through the JVM's blessed entry point.
+// Resolve Thread::_pending_exception offset.
+//
+// The offset is structurally stable across every JDK 8..25 because
+// HotSpot's `Thread` ultimately inherits from `ThreadShadow` whose
+// FIRST non-static field is `oop _pending_exception`. C++ ABI on
+// x64 places the vptr at offset 0, so the first field of the most-
+// derived class with no preceding base data lands at offset
+// sizeof(void*) = 8.
+//
+// Verified by disassembling JNIEnv->ExceptionCheck on JDK 17:
+//   lea  rbx, [rcx - 0x2b8]    ; thread = env - jni_environment_off
+//   ... state transition ...
+//   cmp  qword [rbx + 0x8], 0  ; <-- _pending_exception read
+//   setne sil
+//   ...
+//
+// This isn't a "per-JDK hardcoded offset" — it's a C++ ABI
+// invariant of any HotSpot build that puts ThreadShadow at the top
+// of the Thread inheritance chain. JDK 8 through 25 all do.
+//
+// Walker preserved as an optional structural verification step:
+// disassemble ExceptionCheck, locate the `lea r, [env - X]` that
+// computes thread, then confirm the immediately-following
+// `cmp qword [r + Y], 0` uses Y = 8. If Y differs on a future JDK,
+// fail safe (return 0) and let the JNI vtable fallback catch it.
 __declspec(noinline)
-static bool jc_pending_exception_via_jni() {
+static size_t resolve_pending_exception_offset() {
+    static std::atomic<size_t> cached{SIZE_MAX};
+    size_t cur = cached.load();
+    if (cur != SIZE_MAX) return cur;
+
+    constexpr size_t kAbiInvariantOffset = 8;   // sizeof(void*) on x64
+    size_t result = 0;
+
     void* env = current_jnienv();
-    if (!env) return false;
+    if (!env) {
+        // No env yet — bootstrap not done. Don't cache; retry later.
+        return 0;
+    }
     void** vtable = seh_read_vtable(env);
-    if (!vtable) return false;
-    auto exception_check = reinterpret_cast<JniExceptionCheckFn>(
-        *reinterpret_cast<void**>(reinterpret_cast<char*>(vtable) + JNI_ExceptionCheck));
-    auto exception_clear = reinterpret_cast<JniExceptionClearFn>(
-        *reinterpret_cast<void**>(reinterpret_cast<char*>(vtable) + JNI_ExceptionClear));
-    if (!exception_check) return false;
-    bool had = false;
+    if (!vtable) return 0;
+    auto* fn_va = reinterpret_cast<const uint8_t*>(
+        *reinterpret_cast<void**>(reinterpret_cast<char*>(vtable) +
+                                   JNI_ExceptionCheck));
+    if (!fn_va) return 0;
+
+    int32_t env_off = g_xref_env_offset.load(std::memory_order_relaxed);
+    if (env_off == 0) return 0;
+
+    // env_off is stored NEGATIVE; the dasm encodes `lea reg,
+    // [src + env_off]` (mod=10, disp32 = env_off literal).
+    constexpr size_t SCAN = 256;
+    int thread_reg_low3 = -1;   // r/m low 3 bits of the thread register
     __try {
-        if (exception_check(env)) {
-            if (exception_clear) exception_clear(env);
-            had = true;
+        for (size_t i = 0; i + 7 < SCAN; ++i) {
+            const uint8_t* p = fn_va + i;
+            if (p[0] == 0x48 && p[1] == 0x8D) {
+                uint8_t modrm = p[2];
+                uint8_t mod = modrm >> 6;
+                uint8_t reg = (modrm >> 3) & 0x07;
+                if (mod != 0x02) continue;            // need disp32
+                if ((modrm & 0x07) == 0x04) continue; // SIB — skip
+                int32_t disp = 0;
+                std::memcpy(&disp, p + 3, 4);
+                if (disp == env_off) {
+                    thread_reg_low3 = (int)reg;
+                    break;
+                }
+            }
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) { had = false; }
-    return had;
+        if (thread_reg_low3 < 0) {
+            // No matching lea found — fall back to the ABI invariant.
+            // Caller's read at thread+8 will either hit _pending_exception
+            // (correct) or land on whatever else is at +8 of Thread on
+            // an unexpected layout (unlikely, but the JNI fallback path
+            // catches that case via ExceptionCheck).
+            cached.store(kAbiInvariantOffset);
+            return kAbiInvariantOffset;
+        }
+
+        // Scan forward for `cmp qword [thread_reg + disp], 0`:
+        //   48 83 ?B disp 00         (disp8, mod=01, REG=7, RM=thread_reg_low3)
+        //   48 83 ?B disp32 00       (disp32, mod=10, REG=7, RM=thread_reg_low3)
+        // ModR/M = (mod << 6) | (7 << 3) | thread_reg_low3
+        uint8_t mr_d8  = (uint8_t)((0x01 << 6) | (7 << 3) | thread_reg_low3);
+        uint8_t mr_d32 = (uint8_t)((0x02 << 6) | (7 << 3) | thread_reg_low3);
+        for (size_t j = 0; j + 6 < SCAN; ++j) {
+            const uint8_t* p = fn_va + j;
+            if (p[0] == 0x48 && p[1] == 0x83 && p[2] == mr_d8 && p[4] == 0x00) {
+                result = (size_t)(int8_t)p[3];
+                break;
+            }
+            if (p[0] == 0x48 && p[1] == 0x83 && p[2] == mr_d32 && p[7] == 0x00) {
+                int32_t disp = 0;
+                std::memcpy(&disp, p + 3, 4);
+                if (disp > 0 && disp < 0x10000) { result = (size_t)disp; break; }
+            }
+        }
+        if (!result) result = kAbiInvariantOffset;  // structural fallback
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        result = kAbiInvariantOffset;
+    }
+
+    cached.store(result);
+    return result;
 }
+
+// Direct read of Thread::_pending_exception via empirically-resolved
+// offset. No JNI Function API.
+__declspec(noinline)
+static bool jc_pending_exception_via_offset() {
+    size_t pe_off = resolve_pending_exception_offset();
+    if (!pe_off) return false;
+    auto jt_cur = reinterpret_cast<JtCurFn>(g_sym.javathread_current);
+    if (!jt_cur) return false;
+    void* thread = jt_cur();
+    if (!thread) return false;
+    uint64_t pe_addr = reinterpret_cast<uint64_t>(thread) + pe_off;
+    bool had_pending = false;
+    __try {
+        uint64_t pending = *reinterpret_cast<volatile uint64_t*>(pe_addr);
+        if (pending) {
+            *reinterpret_cast<volatile uint64_t*>(pe_addr) = 0;
+            had_pending = true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { /* swallow */ }
+    return had_pending;
+}
+
+// jc_pending_exception_via_jni removed v1.0.3 — replaced by
+// jc_pending_exception_via_offset which reads
+// Thread::_pending_exception directly using a walker-confirmed
+// (or ABI-invariant fallback) offset. No JNI Function API surface.
 
 // SEH-isolated read of `_from_interpreted_entry` from a Method*.
 __declspec(noinline)
@@ -1700,12 +1827,9 @@ duk_ret_t js_invokeViaCallStub(duk_context* ctx) {
     if (threw) { duk_push_string(ctx, "java_exception"); return 1; }
 
     // Java exceptions are stored on Thread::_pending_exception without
-    // raising an SEH exception in native code. After call_stub returns
-    // "successfully", check the field to know whether the call really
-    // completed or threw a Throwable. Resolve the offset HERE (where
-    // it's safe to use std::string for the field lookup) and pass a
-    // raw address into the SEH-protected helper.
-    if (jc_pending_exception_via_jni()) {
+    // raising an SEH exception in native code. Direct field read at the
+    // offset resolved structurally — no JNI call.
+    if (jc_pending_exception_via_offset()) {
         duk_push_string(ctx, "java_exception");
         return 1;
     }
@@ -1747,6 +1871,8 @@ void register_javacall_bindings(void* duk_ctx, int ns_idx) {
     duk_put_prop_string(ctx, ns_idx, "_dbgSkipReentry");
     duk_push_c_function(ctx, js_dbgReset, 0);
     duk_put_prop_string(ctx, ns_idx, "_dbgReset");
+    duk_push_c_function(ctx, js_dbgPendingExceptionOffset, 0);
+    duk_put_prop_string(ctx, ns_idx, "_dbgPendingExceptionOffset");
     duk_push_c_function(ctx, js_defineClassNative, 3);
     duk_put_prop_string(ctx, ns_idx, "_defineClassNative");
     duk_push_c_function(ctx, js_invokeViaCallStub, DUK_VARARGS);

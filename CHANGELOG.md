@@ -6,6 +6,64 @@ versioning is [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.3] — 2026-05-08
+
+Phase 1 research: `Thread::_pending_exception` resolved structurally,
+JNI `ExceptionCheck` callsite removed.
+
+### Walker
+
+`resolve_pending_exception_offset()` reads the body of
+`JNIEnv->ExceptionCheck` (vtable slot 228), finds the
+`lea reg, [env + env_off]` that computes `thread`, then locates the
+following `cmp qword [thread + disp], 0` instruction and captures its
+disp32 as the field offset. Uses `g_xref_env_offset` (already
+resolved structurally) as the lea-immediate signal.
+
+If disassembly doesn't match a known shape, falls back to the C++
+ABI invariant: `ThreadShadow` puts `_pending_exception` as its first
+non-static field after the vptr, which on x64 lands at offset
+`sizeof(void*) = 8`. Verified across JDK 8/11/17/21/25 — all return
+0x8.
+
+### Removed
+
+- `jc_pending_exception_via_jni()` — replaced entirely by the
+  direct-offset path.
+- `JC` exception detection no longer touches the JNI Function API
+  surface.
+
+### What's still on the JNI surface
+
+- `Marrow._invokeJNI` (full FindClass / GetStaticMethodID /
+  CallStatic*MethodA chain) — still primary path for primitive-arg
+  static method invocation on JDK 8/11. Phase 2 research (per-JDK
+  `JavaCallArguments` layout RE) deferred — that's the multi-day
+  task, not bounded scope.
+- `Marrow._jniVtableSlot` — passive vtable READ used by JC
+  bootstrap to triangulate `JavaCalls::call`. Memory read, not
+  function invocation.
+- `JavaVM->GetEnv` (Invocation API) — embedder bootstrap contract.
+
+### Diagnostic
+
+`Marrow._dbgPendingExceptionOffset()` returns the discovered offset
+(or 0 if env_offset isn't bootstrapped yet — call once after a JC
+warm-up to populate).
+
+### Cross-JDK regression
+
+agent_smoke 24/24 PASS × JDK 8/11/17/21/25 ✅
+
+### Files
+
+- `cpp/src/script/agent_javacall.cpp`:
+  - Added `resolve_pending_exception_offset()` and
+    `jc_pending_exception_via_offset()`.
+  - Removed `jc_pending_exception_via_jni()`.
+  - Replaced both pending-exception callsites with the offset path.
+  - Added `Marrow._dbgPendingExceptionOffset` JS binding.
+
 ## [1.0.2] — 2026-05-08
 
 PDB removal + minor JNI surface cleanup.
